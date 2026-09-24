@@ -1,0 +1,21 @@
+body { background: #f6f8fb; color: #172033; }
+.navbar-brand { letter-spacing: -.03em; }
+.card { border-radius: 1rem; }
+.eyebrow { color: #667085; font-size: .72rem; font-weight: 700; letter-spacing: .12em; }
+.metric { font-size: 1.8rem; font-weight: 700; }
+.provider-banner { background: linear-gradient(115deg, #1456d9, #4c86ed); color: #fff; border-radius: 1rem; }
+.schedule-time { font-size: 1.45rem; font-weight: 700; color: #1456d9; }
+.status-dot { width: .55rem; height: .55rem; display: inline-block; border-radius: 50%; background: #20b26b; }
+.table > :not(caption) > * > * { padding: 1rem .75rem; }
+.consult-frame { min-height: 620px; background: #101828; }
+.message-list { max-height: 240px; overflow-y: auto; }
+.message-bubble { max-width: 80%; border-radius: 1rem; padding: .55rem .8rem; }
+.traffic-log { max-height: 220px; overflow-y: auto; }
+.traffic-log code { white-space: pre-wrap; word-break: break-word; }
+.alarm-icon { display: inline-flex; align-items: center; justify-content: center; width: 3.5rem; height: 3.5rem; border-radius: 50%; background: #dc3545; color: #fff; font-size: 2rem; font-weight: 700; animation: pulse-alarm 1s infinite; }
+.pill-box { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; }
+.pill-compartment { min-height: 100px; border: 2px solid #cbd5e1; border-radius: .75rem; background: #eef2f7; padding: .6rem; text-align: center; transition: all .5s ease; }
+.pill-compartment.taken { background: #dcfce7; border-color: #22c55e; }
+.pill-icon { font-size: 2rem; transition: transform .6s ease, opacity .6s ease; }
+.pill-icon.removed { transform: translateY(30px) scale(0); opacity: 0; }
+@keyframes pulse-alarm { 50% { box-shadow: 0 0 0 12px rgba(220,53,69,.15); } }
