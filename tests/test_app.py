@@ -79,6 +79,33 @@ def test_sensor_model_metadata_requires_authentication(tmp_path):
     assert {"precision", "recall", "f1", "validation_limitations"} <= response.get_json().keys()
 
 
+def test_final_demo_smoke_covers_registration_notifications_ml_sensor_and_assistant(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    registration = client.post(
+        "/api/register",
+        json={"name": "New Patient", "email": "new@example.com", "password": "password123", "role": "Patient"},
+    )
+    assert registration.status_code == 201
+    patient_id = registration.get_json()["user"]["id"]
+    assert client.post("/api/login", json={"email": "new@example.com", "password": "password123"}).status_code == 200
+    token = csrf(client)
+    assert client.post(
+        "/api/notify/alert",
+        json={"patient_id": patient_id, "message": "Demo notification"},
+        headers={"X-CSRF-Token": token},
+    ).get_json()["delivery"] == "in_app"
+    assert client.get(f"/api/aiml/risk/{patient_id}").status_code == 200
+    assert client.get("/api/sensor/demo").status_code == 200
+    assistant = client.post(
+        "/api/assistant/chat",
+        json={"question": "What features are available?"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert assistant.status_code == 200
+    assert assistant.get_json()["intent"] == "features"
+
+
 def test_all_role_dashboards_remain_available(tmp_path):
     app = make_app(tmp_path)
     doctor_id, patient_id, _ = seed(app)

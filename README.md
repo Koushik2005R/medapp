@@ -236,3 +236,114 @@ Single-command startup after Python is installed:
 ```powershell
 python -m pip install -r requirements.txt; $env:SECRET_KEY = "replace-with-a-long-random-value"; python -m flask --app app run
 ```
+
+## Phase 7: final demonstration package
+
+### Architecture and feature boundaries
+
+```text
+Browser (Bootstrap + vanilla JS)
+        |
+        v
+Flask routes and role authorization
+        |
+        +--> SQLite + additive migrations
+        +--> shared dose/sensor processing
+        +--> adherence Random Forest (synthetic research data)
+        +--> sensor Isolation Forest (synthetic signal data)
+        `--> deterministic, authorized PillGuard assistant
+```
+
+**Implemented:** registration/login, CSRF-protected sessions, doctor/patient/
+caregiver authorization, medication schedules, notifications, software dose
+simulation, persistent dose events, explainable adherence ML, load-cell
+anomaly analysis, dashboards, messaging, and the database-grounded assistant.
+
+**Simulated:** HX711/load-cell readings, sensor noise and calibration, buzzer
+states, medication-removal scenarios, synthetic ML training/evaluation data,
+and all demo records created by `scripts/demo_setup.py`.
+
+**Future integrations:** physical ESP32/HX711 hardware, production calibration,
+camera verification, clinical validation, and external AI providers with an
+explicit privacy review. Camera verification is not implemented.
+
+### One-command synthetic demo setup
+
+Run from the repository root. This uses `instance/demo.db`, leaving the normal
+`instance/database.db` untouched:
+
+```powershell
+$env:SECRET_KEY = "demo-only-change-me"; python scripts/demo_setup.py --reset
+```
+
+The script is idempotent without `--reset` and prints separate Doctor, Patient,
+and Caregiver accounts. The password for the printed demo accounts is
+`DemoPass123!`; the printed device key is for the simulated ESP32 client only.
+Start the demo with:
+
+```powershell
+$env:SECRET_KEY = "demo-only-change-me"; $env:DATABASE_URL = "sqlite:///instance/demo.db"; python -m flask --app app run --debug
+```
+
+### Repeatable demonstration script
+
+1. Open `http://127.0.0.1:5000/` and log in as the Doctor. Show the linked
+   patient, schedule configuration, AI Lab, and the synthetic-data badges.
+2. Log in as the Patient. Show the next-dose countdown, schedule, assistant,
+   and the distinction between recorded weight events and proof of swallowing.
+3. Log in as the Caregiver. Show the event timeline, notification, caregiver
+   confirmation control, and assistant source dates.
+4. In the simulator, run `normal_removal`, `delayed_removal`, `no_response`,
+   `noise`, and `unexpected_weight`. Explain the state changes and that
+   anomalies are not consumption confirmation.
+5. From a separate terminal, verify the future hardware boundary:
+
+```powershell
+python scripts/hardware_test.py --base-url http://127.0.0.1:5000 --patient-id <printed-patient-id> --device-key <printed-device-key>
+```
+
+This exercises the authenticated schedule and weight-event contract using
+software HTTP requests; it does not claim that physical hardware was tested.
+
+### Automated validation
+
+Run the complete unit and integration suite with the required secret:
+
+```powershell
+$env:SECRET_KEY = "test-only-secret"; python -m pytest -q
+```
+
+The suite covers authentication, registration, CSRF, role authorization,
+scheduling, simulation state transitions, duplicate notifications, hardware
+access, assistant permissions, adherence-risk APIs, sensor-analysis APIs, and
+dashboard availability. Run `python -m py_compile app.py model.py
+sensor_analysis.py assistant.py scripts/demo_setup.py` for a syntax check.
+
+### Screenshots and review evidence
+
+The application provides the major review views directly in the dashboards:
+Doctor overview, Patient schedule, Caregiver activity, AI Lab, simulator,
+assistant, and the responsive mobile layout. Screenshots should be captured
+from the running demo database after completing the demonstration script; no
+static or synthetic screenshot is committed as evidence. Suggested filenames
+are `doctor-dashboard.png`, `patient-dashboard.png`, `caregiver-dashboard.png`,
+`ai-lab.png`, `simulator-normal-removal.png`, `assistant-sources.png`, and
+`mobile-dashboard.png`.
+
+### Likely viva questions
+
+- Why is the ML data synthetic? Real labelled patient histories are not
+  available; the generator is deterministic and documented, so metrics are
+  reproducible but not clinical evidence.
+- How is target leakage avoided? Upcoming-dose features use only observations
+  earlier than the target event, with a chronological split.
+- Does a weight drop prove swallowing? No. It is an intake/removal signal only.
+- How are users and devices authorized? Session roles and patient links govern
+  records; device keys are hashed and bound to one patient.
+- What happens when history is insufficient? The API returns
+  `INSUFFICIENT_DATA` instead of inventing a risk score.
+- What is the camera status? Camera verification is a documented future
+  integration and is not implemented.
+- Why are anomaly detection and threshold detection separate? Thresholds
+  represent configured removal logic; the Isolation Forest flags unusual
+  windows and cannot confirm consumption.
