@@ -282,7 +282,7 @@ and Caregiver accounts. The password for the printed demo accounts is
 Start the demo with:
 
 ```powershell
-$env:SECRET_KEY = "demo-only-change-me"; $env:DATABASE_URL = "sqlite:///instance/demo.db"; python -m flask --app app run --debug
+$env:SECRET_KEY = "demo-only-change-me"; $env:DATABASE_URL = "sqlite:///$((Resolve-Path .\instance\demo.db).Path.Replace('\','/'))"; python -m flask --app app run --debug
 ```
 
 ### Repeatable demonstration script
