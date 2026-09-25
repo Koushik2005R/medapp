@@ -17,7 +17,8 @@ import secrets
 import re
 import smtplib
 import urllib.request
-from datetime import datetime, timezone
+from statistics import median
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
 from typing import Any, Callable, TypeVar
@@ -40,6 +41,10 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 class User(db.Model):
@@ -94,6 +99,12 @@ class Reminder(db.Model):
     set_by_role: Mapped[str] = mapped_column(db.String(20), nullable=False)
     status: Mapped[str] = mapped_column(db.String(20), nullable=False, default="Active")
     compartment: Mapped[int | None] = mapped_column(db.Integer)
+    tablet_weight: Mapped[float] = mapped_column(db.Float, nullable=False, default=0.5)
+    expected_quantity: Mapped[int] = mapped_column(db.Integer, nullable=False, default=1)
+    tolerance: Mapped[float] = mapped_column(db.Float, nullable=False, default=0.2)
+    calibration_offset: Mapped[float] = mapped_column(db.Float, nullable=False, default=0.0)
+    response_window_minutes: Mapped[int] = mapped_column(db.Integer, nullable=False, default=30)
+    noise_threshold: Mapped[float] = mapped_column(db.Float, nullable=False, default=0.15)
 
     patient: Mapped[User] = relationship(back_populates="reminders", foreign_keys=[patient_id])
 
@@ -107,6 +118,12 @@ class Reminder(db.Model):
             "set_by_role": self.set_by_role,
             "status": self.status,
             "compartment": self.compartment,
+            "tablet_weight": self.tablet_weight,
+            "expected_quantity": self.expected_quantity,
+            "tolerance": self.tolerance,
+            "calibration_offset": self.calibration_offset,
+            "response_window_minutes": self.response_window_minutes,
+            "noise_threshold": self.noise_threshold,
         }
 
 
@@ -127,6 +144,11 @@ class PillLog(db.Model):
     delta_weight: Mapped[float] = mapped_column(db.Float, nullable=False)
     status: Mapped[str] = mapped_column(db.String(20), nullable=False)
     remarks: Mapped[str | None] = mapped_column(db.String(500))
+    reminder_id: Mapped[int | None] = mapped_column(ForeignKey("reminders.id"))
+    dose_event_id: Mapped[int | None] = mapped_column(ForeignKey("dose_events.id"))
+    compartment: Mapped[int | None] = mapped_column(db.Integer)
+    source: Mapped[str | None] = mapped_column(db.String(30))
+    verification_method: Mapped[str | None] = mapped_column(db.String(50))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +160,73 @@ class PillLog(db.Model):
             "delta_weight": self.delta_weight,
             "status": self.status,
             "remarks": self.remarks,
+            "reminder_id": self.reminder_id,
+            "dose_event_id": self.dose_event_id,
+            "compartment": self.compartment,
+            "source": self.source,
+            "verification_method": self.verification_method,
+        }
+
+
+DOSE_STATES = (
+    "IDLE",
+    "REMINDER_DUE",
+    "ALERTING",
+    "REMOVAL_DETECTED",
+    "AWAITING_CONFIRMATION",
+    "MISSED",
+    "MANUALLY_CONFIRMED",
+)
+
+
+class DoseEvent(db.Model):
+    __tablename__ = "dose_events"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('IDLE', 'REMINDER_DUE', 'ALERTING', 'REMOVAL_DETECTED', "
+            "'AWAITING_CONFIRMATION', 'MISSED', 'MANUALLY_CONFIRMED')",
+            name="ck_dose_event_state",
+        ),
+        UniqueConstraint("event_key", name="uq_dose_event_key"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_key: Mapped[str] = mapped_column(db.String(180), nullable=False)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), nullable=False, index=True)
+    compartment: Mapped[int | None] = mapped_column(db.Integer)
+    scheduled_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(db.String(30), nullable=False, default="IDLE")
+    source: Mapped[str] = mapped_column(db.String(30), nullable=False, default="simulation")
+    verification_method: Mapped[str | None] = mapped_column(db.String(50))
+    initial_weight: Mapped[float | None] = mapped_column(db.Float)
+    final_weight: Mapped[float | None] = mapped_column(db.Float)
+    filtered_delta: Mapped[float | None] = mapped_column(db.Float)
+    detected_at: Mapped[datetime | None] = mapped_column(db.DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(db.DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(db.DateTime(timezone=True))
+    notification_sent: Mapped[bool] = mapped_column(db.Boolean, nullable=False, default=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "event_key": self.event_key,
+            "patient_id": self.patient_id,
+            "reminder_id": self.reminder_id,
+            "compartment": self.compartment,
+            "scheduled_at": self.scheduled_at.isoformat(),
+            "due_at": self.due_at.isoformat(),
+            "state": self.state,
+            "source": self.source,
+            "verification_method": self.verification_method,
+            "initial_weight": self.initial_weight,
+            "final_weight": self.final_weight,
+            "filtered_delta": self.filtered_delta,
+            "detected_at": self.detected_at.isoformat() if self.detected_at else None,
+            "acknowledged_at": self.acknowledged_at.isoformat() if self.acknowledged_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "notification_sent": self.notification_sent,
         }
 
 
@@ -243,6 +332,17 @@ def migrate_schema() -> None:
         db.session.execute(db.text("INSERT INTO schema_version(version) VALUES (0)"))
     for table, column, definition in (
         ("reminders", "compartment", "INTEGER"),
+        ("reminders", "tablet_weight", "FLOAT NOT NULL DEFAULT 0.5"),
+        ("reminders", "expected_quantity", "INTEGER NOT NULL DEFAULT 1"),
+        ("reminders", "tolerance", "FLOAT NOT NULL DEFAULT 0.2"),
+        ("reminders", "calibration_offset", "FLOAT NOT NULL DEFAULT 0.0"),
+        ("reminders", "response_window_minutes", "INTEGER NOT NULL DEFAULT 30"),
+        ("reminders", "noise_threshold", "FLOAT NOT NULL DEFAULT 0.15"),
+        ("pill_logs", "reminder_id", "INTEGER"),
+        ("pill_logs", "dose_event_id", "INTEGER"),
+        ("pill_logs", "compartment", "INTEGER"),
+        ("pill_logs", "source", "VARCHAR(30)"),
+        ("pill_logs", "verification_method", "VARCHAR(50)"),
     ):
         columns = {
             row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).all()
@@ -411,27 +511,156 @@ def record_hardware_traffic(endpoint: str, method: str, payload: Any, response_s
     )
 
 
-def create_pill_log(patient_id: int, w_before: float, w_after: float) -> tuple[PillLog, str | None]:
-    delta_weight = w_before - w_after
-    status = "Taken" if delta_weight >= 2.0 else "Missed"
+def event_schedule(reminder: Reminder, when: datetime) -> datetime:
+    hour, minute = (int(part) for part in reminder.time.split(":"))
+    return when.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def event_key(patient_id: int, reminder_id: int, scheduled_at: datetime) -> str:
+    return f"{scheduled_at.date().isoformat()}:{patient_id}:{reminder_id}"
+
+
+def get_or_create_dose_event(
+    patient: User, reminder: Reminder, when: datetime, source: str
+) -> DoseEvent:
+    scheduled_at = event_schedule(reminder, when)
+    key = event_key(patient.id, reminder.id, scheduled_at)
+    event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.event_key == key))
+    if event is None:
+        event = DoseEvent(
+            event_key=key,
+            patient_id=patient.id,
+            reminder_id=reminder.id,
+            compartment=reminder.compartment,
+            scheduled_at=scheduled_at,
+            due_at=scheduled_at,
+            state="IDLE" if scheduled_at > when else "REMINDER_DUE",
+            source=source,
+        )
+        db.session.add(event)
+        db.session.flush()
+    return event
+
+
+def expire_event(event: DoseEvent, now: datetime) -> bool:
+    reminder = db.session.get(Reminder, event.reminder_id)
+    if (
+        reminder is None
+        or event.state in {"MISSED", "MANUALLY_CONFIRMED"}
+        or now <= as_utc(event.due_at) + timedelta(minutes=reminder.response_window_minutes)
+    ):
+        return False
+    event.state = "MISSED"
+    event.completed_at = now
+    if not db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)):
+        db.session.add(PillLog(
+            patient_id=event.patient_id,
+            reminder_id=event.reminder_id,
+            dose_event_id=event.id,
+            compartment=event.compartment,
+            timestamp=now,
+            initial_weight=event.initial_weight or 0.0,
+            final_weight=event.final_weight or 0.0,
+            delta_weight=event.filtered_delta or 0.0,
+            status="Missed",
+            source=event.source,
+            verification_method="response_window_expired",
+        ))
+    if not event.notification_sent:
+        patient = db.session.get(User, event.patient_id)
+        dispatch_alert(patient, "Missed medication detected. Please check the patient's pill box.")
+        event.notification_sent = True
+    return True
+
+
+def complete_dose_event(
+    event: DoseEvent, now: datetime, verification_method: str
+) -> tuple[PillLog, str | None]:
+    existing = db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id))
+    if existing:
+        return existing, None
     pill_log = PillLog(
-        patient_id=patient_id,
-        timestamp=utc_now(),
-        initial_weight=w_before,
-        final_weight=w_after,
-        delta_weight=delta_weight,
-        status=status,
+        patient_id=event.patient_id,
+        reminder_id=event.reminder_id,
+        dose_event_id=event.id,
+        compartment=event.compartment,
+        timestamp=now,
+        initial_weight=event.initial_weight or 0.0,
+        final_weight=event.final_weight or 0.0,
+        delta_weight=event.filtered_delta or 0.0,
+        status="Manual Override",
+        source=event.source,
+        verification_method=verification_method,
     )
     db.session.add(pill_log)
     db.session.flush()
-    alert_delivery = None
-    if status == "Missed":
-        patient = db.session.get(User, patient_id)
-        alert_delivery = dispatch_alert(
-            patient,
-            "Missed medication detected. Please check the patient's pill box.",
+    event.state = "MANUALLY_CONFIRMED"
+    event.verification_method = verification_method
+    event.completed_at = now
+    return pill_log, None
+
+
+def reminder_for_input(patient_id: int, reminder_id: Any, compartment: Any) -> Reminder | None:
+    if isinstance(reminder_id, int):
+        reminder = db.session.get(Reminder, reminder_id)
+        return reminder if reminder and reminder.patient_id == patient_id else None
+    if isinstance(compartment, int):
+        return db.session.scalar(
+            db.select(Reminder).where(
+                Reminder.patient_id == patient_id,
+                Reminder.compartment == compartment,
+                Reminder.status == "Active",
+            ).order_by(Reminder.id.desc())
         )
-    return pill_log, alert_delivery
+    return db.session.scalar(
+        db.select(Reminder).where(
+            Reminder.patient_id == patient_id, Reminder.status == "Active"
+        ).order_by(Reminder.id.desc())
+    )
+
+
+def process_sensor_reading(
+    patient: User,
+    reminder: Reminder,
+    before: float,
+    after: float,
+    source: str,
+    samples_before: list[float] | None = None,
+    samples_after: list[float] | None = None,
+    when: datetime | None = None,
+) -> tuple[DoseEvent, PillLog | None]:
+    now = when or utc_now()
+    event = get_or_create_dose_event(patient, reminder, now, source)
+    if event.state in {"MISSED", "MANUALLY_CONFIRMED"} or event.completed_at:
+        return event, db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id))
+    if event.state in {"AWAITING_CONFIRMATION", "REMOVAL_DETECTED"} and event.filtered_delta is not None:
+        return event, None
+    if expire_event(event, now):
+        return event, None
+    def clean_samples(values: list[float] | None, fallback: float) -> list[float]:
+        if not values:
+            return [fallback]
+        cleaned = [
+            float(value) for value in values
+            if valid_weight(value)
+        ]
+        return cleaned or [fallback]
+
+    before_value = median(clean_samples(samples_before, before)) + reminder.calibration_offset
+    after_value = median(clean_samples(samples_after, after)) + reminder.calibration_offset
+    delta = before_value - after_value
+    event.initial_weight = before_value
+    event.final_weight = after_value
+    event.filtered_delta = delta
+    event.detected_at = now
+    event.source = source
+    expected = reminder.tablet_weight * reminder.expected_quantity
+    if delta > reminder.noise_threshold:
+        event.state = "REMOVAL_DETECTED"
+    if abs(delta - expected) <= reminder.tolerance:
+        event.state = "REMOVAL_DETECTED"
+        event.verification_method = "calibrated_weight_delta"
+    return event, None
 
 
 def alarm_key(patient_id: int, reminder_id: int, when: datetime) -> str:
@@ -543,22 +772,23 @@ def register_routes(app: Flask) -> None:
             return json_error("w_after cannot exceed w_before", 400)
         if db.session.get(User, patient_id) is None or device_patient_user.role != "Patient":
             return json_error("patient not found", 404)
-
-        pill_log, alert_delivery = create_pill_log(
-            patient_id, float(w_before), float(w_after)
+        reminder = reminder_for_input(patient_id, data.get("reminder_id"), data.get("compartment"))
+        if reminder is None:
+            return json_error("an active medication schedule is required", 409)
+        event, pill_log = process_sensor_reading(
+            device_patient_user, reminder, float(w_before), float(w_after), "hardware",
+            data.get("samples_before"), data.get("samples_after"),
         )
-        status = pill_log.status
-        record_hardware_traffic(request.path, request.method, data, 201)
+        record_hardware_traffic(request.path, request.method, data, 200)
         db.session.commit()
         return jsonify(
             {
                 "status": "success",
-                "event": status,
-                "trigger_buzzer": status == "Missed",
-                "alert_delivery": alert_delivery,
-                "log": pill_log.to_dict(),
+                "state": event.state,
+                "event": event.to_dict(),
+                "log": pill_log.to_dict() if pill_log else None,
             }
-        ), 201
+        ), 200
 
     @app.post("/api/simulation/log-event")
     @role_required("Doctor", "Caregiver", "Patient")
@@ -570,26 +800,61 @@ def register_routes(app: Flask) -> None:
         patient = get_patient(patient_id)
         if patient is None or not can_access_patient(actor, patient):
             return json_error("You do not have access to this patient", 403)
-        if not scheduled_alarm_is_acknowledged(patient.id):
-            return json_error("A scheduled medication alarm must be acknowledged before simulation", 409)
         if not all(valid_weight(value) for value in (w_before, w_after)):
             return json_error("weights must be finite numbers from 0 to 100000", 400)
         if float(w_after) > float(w_before):
             return json_error("w_after cannot exceed w_before", 400)
-        pill_log, alert_delivery = create_pill_log(
-            patient.id, float(w_before), float(w_after)
+        reminder = reminder_for_input(patient.id, data.get("reminder_id"), data.get("compartment"))
+        if reminder is None:
+            return json_error("an active medication schedule is required", 409)
+        existing_event = db.session.scalar(
+            db.select(DoseEvent).where(
+                DoseEvent.patient_id == patient.id,
+                DoseEvent.reminder_id == reminder.id,
+                DoseEvent.state.in_(("AWAITING_CONFIRMATION", "REMOVAL_DETECTED")),
+            ).order_by(DoseEvent.scheduled_at.desc())
+        )
+        if existing_event is None:
+            return json_error("acknowledge the medication alarm before simulating", 409)
+        event, pill_log = process_sensor_reading(
+            patient, reminder, float(w_before), float(w_after), "simulation",
+            data.get("samples_before"), data.get("samples_after"),
         )
         record_hardware_traffic("/api/simulation/log-event", "POST", data, 201)
         db.session.commit()
         return jsonify({
             "status": "success",
-            "event": pill_log.status,
-            "delta_weight": pill_log.delta_weight,
+            "state": event.state,
+            "event": event.to_dict(),
+            "delta_weight": event.filtered_delta,
             "risk": risk_payload(patient.id),
-            "trigger_buzzer": pill_log.status == "Missed",
-            "alert_delivery": alert_delivery,
-            "log": pill_log.to_dict(),
-        }), 201
+            "log": pill_log.to_dict() if pill_log else None,
+        }), 200
+
+    @app.get("/api/simulation/events")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def simulation_events():
+        actor = current_user()
+        patient = get_patient(request.args.get("patient_id", type=int))
+        if patient is None or not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient", 403)
+        now = utc_now()
+        events = db.session.scalars(
+            db.select(DoseEvent).where(DoseEvent.patient_id == patient.id)
+            .order_by(DoseEvent.scheduled_at.desc()).limit(30)
+        ).all()
+        changed = False
+        for event in events:
+            if event.state == "IDLE" and now >= as_utc(event.scheduled_at):
+                event.state = "REMINDER_DUE"
+                changed = True
+            if event.state == "REMINDER_DUE" and now >= as_utc(event.scheduled_at):
+                event.state = "ALERTING"
+                changed = True
+            changed = expire_event(event, now) or changed
+        if changed:
+            db.session.commit()
+        return jsonify({"events": [event.to_dict() for event in events]})
 
     @app.get("/api/hardware/traffic")
     @role_required("Doctor", "Caregiver")
@@ -751,11 +1016,42 @@ def register_routes(app: Flask) -> None:
         data = request.get_json(silent=True) or {}
         med_name, reminder_time, dosage = data.get("med_name"), data.get("time"), data.get("dosage")
         compartment = data.get("compartment")
+        tablet_weight = data.get("tablet_weight", 0.5)
+        expected_quantity = data.get("expected_quantity", 1)
+        tolerance = data.get("tolerance", 0.2)
+        calibration_offset = data.get("calibration_offset", 0.0)
+        response_window_minutes = data.get("response_window_minutes", 30)
+        noise_threshold = data.get("noise_threshold", 0.15)
         if isinstance(compartment, str) and compartment.strip():
             try:
                 compartment = int(compartment)
             except ValueError:
                 compartment = None
+        for field in ("expected_quantity", "response_window_minutes"):
+            value = locals()[field]
+            if isinstance(value, str) and value.strip():
+                try:
+                    if field == "expected_quantity":
+                        expected_quantity = int(value)
+                    else:
+                        response_window_minutes = int(value)
+                except ValueError:
+                    pass
+        for field in ("tablet_weight", "tolerance", "calibration_offset", "noise_threshold"):
+            value = locals()[field]
+            if isinstance(value, str) and value.strip():
+                try:
+                    converted = float(value)
+                    if field == "tablet_weight":
+                        tablet_weight = converted
+                    elif field == "tolerance":
+                        tolerance = converted
+                    elif field == "calibration_offset":
+                        calibration_offset = converted
+                    else:
+                        noise_threshold = converted
+                except ValueError:
+                    pass
         can_edit = patient and (
             (actor.role == "Doctor" and patient.linked_doctor_id == actor.id)
             or (actor.role == "Caregiver" and patient.linked_caregiver_id == actor.id)
@@ -770,6 +1066,21 @@ def register_routes(app: Flask) -> None:
             not isinstance(compartment, int) or isinstance(compartment, bool) or not 1 <= compartment <= 8
         ):
             return json_error("compartment must be an integer from 1 to 8", 400)
+        if (
+            not valid_weight(tablet_weight) or float(tablet_weight) <= 0
+            or not isinstance(expected_quantity, int) or isinstance(expected_quantity, bool)
+            or not 1 <= expected_quantity <= 100
+            or not valid_weight(tolerance) or float(tolerance) <= 0
+            or not isinstance(response_window_minutes, int)
+            or isinstance(response_window_minutes, bool)
+            or not 1 <= response_window_minutes <= 1440
+            or not valid_weight(noise_threshold)
+            or float(noise_threshold) <= 0
+            or not isinstance(calibration_offset, (int, float))
+            or isinstance(calibration_offset, bool)
+            or not math.isfinite(float(calibration_offset))
+        ):
+            return json_error("invalid sensor configuration", 400)
         reminder = Reminder(
             patient_id=patient.id,
             med_name=med_name.strip(),
@@ -777,6 +1088,12 @@ def register_routes(app: Flask) -> None:
             dosage=dosage.strip(),
             set_by_role=actor.role,
             compartment=compartment,
+            tablet_weight=float(tablet_weight),
+            expected_quantity=expected_quantity,
+            tolerance=float(tolerance),
+            calibration_offset=float(calibration_offset),
+            response_window_minutes=response_window_minutes,
+            noise_threshold=float(noise_threshold),
         )
         db.session.add(reminder)
         db.session.commit()
@@ -847,6 +1164,12 @@ def register_routes(app: Flask) -> None:
             return json_error("override reason is required", 400)
         log.status = "Manual Override"
         log.remarks = reason.strip()
+        if log.dose_event_id:
+            event = db.session.get(DoseEvent, log.dose_event_id)
+            if event and event.state in {"MISSED", "AWAITING_CONFIRMATION", "REMOVAL_DETECTED"}:
+                event.state = "MANUALLY_CONFIRMED"
+                event.verification_method = "caregiver_override"
+                event.completed_at = utc_now()
         db.session.commit()
         return jsonify({"status": "success", "log": log.to_dict()})
 
@@ -883,15 +1206,84 @@ def register_routes(app: Flask) -> None:
             return json_error("scheduled reminder not found", 404)
         if not can_access_patient(actor, patient):
             return json_error("You do not have access to this patient", 403)
-        now = datetime.now()
-        if reminder.time != now.strftime("%H:%M"):
-            return json_error("The medication alarm is not active yet", 409)
+        now = utc_now()
+        event = get_or_create_dose_event(patient, reminder, now, "simulation")
+        if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
+            return json_error("this scheduled dose is already closed", 409)
+        if event.state == "IDLE":
+            return json_error("the medication reminder is not due yet", 409)
+        event.state = "AWAITING_CONFIRMATION"
+        event.acknowledged_at = now
         acknowledged = session.setdefault("acknowledged_alarms", [])
         key = alarm_key(patient.id, reminder.id, now)
         if key not in acknowledged:
             acknowledged.append(key)
         session.modified = True
-        return jsonify({"status": "success", "patient_id": patient.id, "reminder_id": reminder.id})
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "patient_id": patient.id,
+            "reminder_id": reminder.id,
+            "state": event.state,
+            "event": event.to_dict(),
+        })
+
+    @app.post("/api/simulation/events/<int:event_id>/confirm")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def confirm_simulation_event(event_id: int):
+        actor = current_user()
+        event = db.session.get(DoseEvent, event_id)
+        patient = get_patient(event.patient_id) if event else None
+        if event is None or patient is None or not can_access_patient(actor, patient):
+            return json_error("dose event not found", 404)
+        if event.state not in {"AWAITING_CONFIRMATION", "REMOVAL_DETECTED"}:
+            return json_error("dose event is not awaiting confirmation", 409)
+        event.source = event.source or "simulation"
+        pill_log, _ = complete_dose_event(event, utc_now(), "manual_confirmation")
+        db.session.commit()
+        return jsonify({"status": "success", "event": event.to_dict(), "log": pill_log.to_dict()})
+
+    @app.post("/api/simulation/scenario")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def simulation_scenario():
+        actor = current_user()
+        data = request.get_json(silent=True) or {}
+        patient = get_patient(data.get("patient_id"))
+        reminder = reminder_for_input(
+            data.get("patient_id"), data.get("reminder_id"), data.get("compartment")
+        )
+        scenario = data.get("scenario")
+        if patient is None or reminder is None or not can_access_patient(actor, patient):
+            return json_error("authorized patient and active schedule are required", 400)
+        if scenario not in {"normal_removal", "delayed_removal", "no_response", "noise", "unexpected_weight"}:
+            return json_error("unknown simulation scenario", 400)
+        now = utc_now()
+        event = get_or_create_dose_event(patient, reminder, now, "simulation")
+        if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
+            return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})
+        event.acknowledged_at = now
+        event.state = "AWAITING_CONFIRMATION"
+        expected = reminder.tablet_weight * reminder.expected_quantity
+        if scenario == "no_response":
+            event.due_at = now - timedelta(minutes=reminder.response_window_minutes + 1)
+            expire_event(event, now)
+        else:
+            before = 100.0
+            after = before - expected
+            if scenario == "delayed_removal":
+                event.due_at = now - timedelta(minutes=max(1, reminder.response_window_minutes - 1))
+            if scenario == "noise":
+                before, after = 100.0, 99.95
+            elif scenario == "unexpected_weight":
+                before, after = 100.0, 100.0 - expected - (reminder.tolerance * 3)
+            process_sensor_reading(
+                patient, reminder, before, after, "simulation",
+                [before, before + 0.03, before - 0.02],
+                [after, after + 0.02, after - 0.01],
+                now,
+            )
+        db.session.commit()
+        return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})
 
     @app.post("/api/notify/alert")
     @role_required("Doctor", "Patient", "Caregiver")

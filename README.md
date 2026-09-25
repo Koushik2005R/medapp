@@ -55,10 +55,11 @@ curl.exe -X POST http://127.0.0.1:5000/api/hardware/log-event `
   -d '{\"patient_id\":1,\"w_before\":100.0,\"w_after\":95.0}'
 ```
 
-The backend computes `delta_weight = w_before - w_after`. A delta of at least
-2.0 grams is recorded as `Taken`; smaller deltas are recorded as `Missed`.
-`trigger_buzzer` is `true` for a missed event so the hardware can alert the
-patient or caregiver.
+The backend applies the reminder's calibrated tablet weight, expected quantity,
+tolerance, calibration offset, response window and median noise filter. A
+weight change produces `REMOVAL_DETECTED` and then
+`AWAITING_CONFIRMATION`; it never claims that medication was swallowed.
+`MISSED` is created only after the configured response window expires.
 
 ## Dashboard
 
@@ -115,14 +116,28 @@ The response is `{ "patient_id": 1, "risk_score": 82.5, "level": "HIGH" }`.
 Doctor and caregiver dashboards include the same score as a color-coded risk
 badge.
 
-## Phase 5: simulation and hardware verification
+## Phase 2: medication monitoring simulator
 
-The Doctor, Caregiver, and Patient portals include an HX711 weight simulator.
-Choose a patient and enter `W_before` and `W_after`; the simulator posts to
-`POST /api/simulation/log-event`, applies the 2.0g threshold, writes a normal
-`PillLog`, creates a missed-dose alert when needed, and returns the recalculated
-AIML risk. Doctor and Caregiver views also show the last 50 raw hardware
-requests from `GET /api/hardware/traffic`.
+The Doctor, Caregiver, and Patient portals include a live software simulator
+with a pill-box diagram, simulated HX711 graph, buzzer indicator, event
+timeline, and repeatable scenarios for normal removal, delayed removal, no
+response, sensor noise, and unexpected weight changes. Every reading is
+explicitly labelled simulated. The state machine is:
+
+`IDLE -> REMINDER_DUE -> ALERTING -> AWAITING_CONFIRMATION ->
+REMOVAL_DETECTED -> MANUALLY_CONFIRMED` (or `MISSED` after timeout).
+
+Medication schedules store tablet weight, expected quantity, tolerance,
+calibration offset, response window, and noise threshold. Both
+`POST /api/simulation/log-event` and the authenticated hardware endpoint use the
+same sensor processing interface. `GET /api/simulation/events?patient_id=1`
+returns the event timeline, and `POST /api/simulation/events/<event_id>/confirm`
+records an explicit manual confirmation. Repeated readings reuse the same
+patient/reminder/date event and caregiver notifications are sent at most once.
+
+Doctor and Caregiver views also show the last 50 raw hardware requests from
+`GET /api/hardware/traffic`. Weight-based removal is an intake signal only; it
+does not prove swallowing.
 
 Useful ESP32/local Wi-Fi checks:
 

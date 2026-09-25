@@ -71,7 +71,7 @@ function configureAlarms(schedules) {
 function simulationPanel(patients, includeTraffic = true) {
   const options = patients.map((patient) => `<option value="${patient.id}">${esc(patient.name)}</option>`).join('');
   const traffic = includeTraffic ? `<hr><div class="d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">Live hardware API traffic</h3><button id="refreshTrafficBtn" class="btn btn-sm btn-outline-secondary">Refresh</button></div><div id="trafficLog" class="traffic-log mt-2">${empty('No hardware requests logged yet.')}</div>` : '';
-  return `<div class="card border-0 shadow-sm p-4 mt-4"><div class="d-flex justify-content-between align-items-center"><div><h2 class="h5 mb-1">HX711 weight simulator</h2><p class="small text-secondary mb-0">Acknowledge a scheduled alarm before simulating intake.</p></div><span class="badge text-bg-light">Threshold 2.0g</span></div><div data-simulation-lock class="${state.simulationUnlocked ? 'd-none' : ''} alert alert-warning mt-3 mb-0">Locked until the medication alarm sounds and you click <strong>Acknowledge Alert</strong>.</div><form id="simulationForm" data-simulation-controls class="row g-2 mt-3 ${state.simulationUnlocked ? '' : 'd-none'}"><div class="col-md-3"><label class="form-label small">Patient</label><select name="patient_id" class="form-select" required>${options}</select></div><div class="col-md-3"><label class="form-label small">W_before (g)</label><input name="w_before" type="number" min="0" step="0.1" value="100" class="form-control" required></div><div class="col-md-3"><label class="form-label small">W_after (g)</label><input name="w_after" type="number" min="0" step="0.1" value="95" class="form-control" required></div><div class="col-md-3 d-flex align-items-end"><button class="btn btn-primary w-100">Simulate intake</button></div></form><div id="simulationResult" class="small mt-3"></div>${traffic}</div>`;
+  return `<div class="card border-0 shadow-sm p-4 mt-4 simulator-card"><div class="d-flex justify-content-between align-items-start"><div><p class="eyebrow mb-1">SOFTWARE SIMULATION</p><h2 class="h5 mb-1">Live pill-box simulator</h2><p class="small text-secondary mb-0">All readings and events are simulated; weight change does not prove swallowing.</p></div><div class="text-end"><span id="simBuzzer" class="badge text-bg-secondary">Buzzer idle</span><div id="simState" class="badge text-bg-light mt-2">IDLE</div></div></div><div data-simulation-lock class="${state.simulationUnlocked ? 'd-none' : ''} alert alert-warning mt-3 mb-0">Acknowledge the medication alarm to begin a dose simulation.</div><div data-simulation-controls class="${state.simulationUnlocked ? '' : 'd-none'}"><div class="row g-3 mt-1"><div class="col-lg-5"><div class="pill-box simulator-pill-box">${[1,2,3,4,5,6,7,8].map((slot) => `<div class="pill-compartment" data-sim-compartment="${slot}"><div class="pill-icon">💊</div><div class="small fw-semibold">Slot ${slot}</div><div class="small text-secondary">ready</div></div>`).join('')}</div></div><div class="col-lg-7"><div class="d-flex flex-wrap gap-2 mb-2"><select id="scenarioPatient" class="form-select form-select-sm w-auto">${options}</select><button data-scenario="normal_removal" class="btn btn-sm btn-success">Normal removal</button><button data-scenario="delayed_removal" class="btn btn-sm btn-warning">Delayed removal</button><button data-scenario="no_response" class="btn btn-sm btn-danger">No response</button><button data-scenario="noise" class="btn btn-sm btn-outline-secondary">Noise</button><button data-scenario="unexpected_weight" class="btn btn-sm btn-outline-danger">Unexpected weight</button></div><div class="sensor-graph border rounded-3 p-2"><div class="small text-secondary mb-1">Calibrated HX711 stream (simulated grams)</div><svg id="sensorGraph" viewBox="0 0 500 120" role="img" aria-label="Simulated sensor graph"><polyline points="0,90 50,88 100,91 150,87 200,90 250,88 300,90 350,89 400,90 450,88 500,90" fill="none" stroke="#2563eb" stroke-width="3"/></svg></div></div></div><div class="row g-3 mt-1"><div class="col-lg-5"><form id="simulationForm" class="row g-2"><div class="col-6"><label class="form-label small">W_before (g)</label><input name="w_before" type="number" min="0" step="0.1" value="100" class="form-control" required></div><div class="col-6"><label class="form-label small">W_after (g)</label><input name="w_after" type="number" min="0" step="0.1" value="99.5" class="form-control" required></div><div class="col-12"><button class="btn btn-primary w-100">Process sensor reading</button></div></form><div id="simulationResult" class="small mt-2"></div></div><div class="col-lg-7"><h3 class="h6 mb-2">Dose event timeline</h3><div id="eventTimeline" class="traffic-log border rounded-3 p-2">${empty('No simulated dose events yet.')}</div><button id="confirmEventBtn" class="btn btn-sm btn-outline-success mt-2 d-none">Manually confirm removal</button></div></div></div>${traffic}</div>`;
 }
 async function refreshTraffic() {
   const data = await api('/api/hardware/traffic');
@@ -81,19 +81,29 @@ function bindSimulation(patients) {
   $('#simulationForm').onsubmit = async (event) => {
     event.preventDefault();
     const values = formData(event.target);
-    values.patient_id = Number(values.patient_id); values.w_before = Number(values.w_before); values.w_after = Number(values.w_after);
+    values.patient_id = Number($('#scenarioPatient').value); values.w_before = Number(values.w_before); values.w_after = Number(values.w_after);
     try {
       const result = await api('/api/simulation/log-event', {method:'POST', body: JSON.stringify(values)});
-      $('#simulationResult').innerHTML = `<span class="badge ${result.event === 'Taken' ? 'text-bg-success' : 'text-bg-danger'}">${esc(result.event)}</span> Delta: ${Number(result.delta_weight).toFixed(1)}g · ${riskBadge(result.risk)}`;
-      notify(`Simulation logged as ${result.event}`);
-      if (result.event === 'Taken') {
-        stopBuzzer();
-        const compartment = state.alarm?.reminder?.compartment;
-        document.querySelector(`[data-pill="${compartment || 1}"]`)?.classList.add('removed');
-        if ($('#patientConfirmation')) $('#patientConfirmation').innerHTML = '<div class="alert alert-success">Dose Confirmed &amp; Logged to Doctor\'s Portal</div>';
-      }
+      renderSimulationEvent(result.event);
+      notify(`Sensor processed: ${result.state}`);
       if ($('#trafficLog')) await refreshTraffic();
       if (state.user.role === 'Caregiver') await loadCaregiver();
+    } catch (error) { notify(error.message, 'danger'); }
+  };
+  document.querySelectorAll('[data-scenario]').forEach((button) => {
+    button.onclick = async () => {
+      try {
+        const result = await api('/api/simulation/scenario', {method:'POST', body: JSON.stringify({patient_id: Number($('#scenarioPatient').value), scenario: button.dataset.scenario})});
+        renderSimulationEvent(result.event);
+        notify(`${button.textContent}: ${result.event.state}`);
+      } catch (error) { notify(error.message, 'danger'); }
+    };
+  });
+  $('#confirmEventBtn').onclick = async () => {
+    const eventId = $('#confirmEventBtn').dataset.eventId;
+    try {
+      const result = await api(`/api/simulation/events/${eventId}/confirm`, {method:'POST', body: '{}'});
+      renderSimulationEvent(result.event); notify('Removal manually confirmed.');
     } catch (error) { notify(error.message, 'danger'); }
   };
   if ($('#refreshTrafficBtn')) {
@@ -104,9 +114,29 @@ function bindSimulation(patients) {
     if (!state.alarm) return;
     try {
       await api('/api/alarm/acknowledge', {method:'POST', body: JSON.stringify({patient_id: state.alarm.patientId, reminder_id: state.alarm.reminder.id})});
-      stopBuzzer(); window.speechSynthesis?.cancel(); unlockSimulation(); bootstrap.Modal.getOrCreateInstance($('#alarmModal')).hide(); notify('Alert acknowledged. Simulation controls unlocked.');
+      stopBuzzer(); window.speechSynthesis?.cancel(); unlockSimulation(); bootstrap.Modal.getOrCreateInstance($('#alarmModal')).hide(); notify('Alarm acknowledged. Awaiting sensor confirmation.');
     } catch (error) { notify(error.message, 'danger'); }
   };
+  refreshSimulationEvents(Number($('#scenarioPatient').value));
+}
+async function refreshSimulationEvents(patientId) {
+  if (!$('#eventTimeline')) return;
+  try {
+    const data = await api(`/api/simulation/events?patient_id=${patientId}`);
+    $('#eventTimeline').innerHTML = data.events.length ? data.events.map((event) => `<div class="border-bottom py-2"><span class="badge text-bg-${event.state === 'MISSED' ? 'danger' : event.state === 'MANUALLY_CONFIRMED' ? 'success' : 'primary'}">${esc(event.state)}</span> <span class="small">${new Date(event.scheduled_at).toLocaleString()}</span><br><span class="small text-secondary">${esc(event.source)} · ${esc(event.verification_method || 'awaiting verification')} · ${event.filtered_delta == null ? '--' : Number(event.filtered_delta).toFixed(2) + 'g'}</span></div>`).join('') : empty('No simulated dose events yet.');
+  } catch (error) { notify(error.message, 'danger'); }
+}
+function renderSimulationEvent(event) {
+  if (!event) return;
+  $('#simState').textContent = event.state;
+  $('#simState').className = `badge text-bg-${event.state === 'MISSED' ? 'danger' : event.state === 'MANUALLY_CONFIRMED' ? 'success' : 'primary'} mt-2`;
+  $('#simBuzzer').textContent = event.state === 'ALERTING' ? 'Buzzer active' : 'Buzzer idle';
+  $('#simBuzzer').className = `badge ${event.state === 'ALERTING' ? 'text-bg-danger' : 'text-bg-secondary'}`;
+  const confirm = $('#confirmEventBtn');
+  if (confirm) { confirm.dataset.eventId = event.id; confirm.classList.toggle('d-none', !['AWAITING_CONFIRMATION', 'REMOVAL_DETECTED'].includes(event.state)); }
+  if (event.compartment) document.querySelector(`[data-sim-compartment="${event.compartment}"]`)?.classList.toggle('taken', event.state === 'MANUALLY_CONFIRMED');
+  if ($('#sensorGraph') && event.filtered_delta != null) $('#sensorGraph').querySelector('polyline').setAttribute('points', `0,90 60,88 120,90 180,88 240,90 300,${Math.max(10, 90 - Math.min(70, event.filtered_delta * 8))} 360,${Math.max(10, 90 - Math.min(70, event.filtered_delta * 8))} 420,88 500,90`);
+  refreshSimulationEvents(Number($('#scenarioPatient').value));
 }
 let jitsiApi = null;
 function communicationPanel(patients, selectedId = '') {
@@ -147,7 +177,7 @@ async function loadDoctor() {
   const patients = data.patients;
   $('#doctorView').innerHTML = `<div class="row g-4">
     <div class="col-lg-4"><div class="card border-0 shadow-sm p-4"><h2 class="h5">Add a patient</h2><p class="small text-secondary">Link an existing patient by email.</p><form id="linkPatientForm" class="d-flex gap-2"><input name="email" type="email" class="form-control" placeholder="patient@email.com" required><button class="btn btn-primary">Add</button></form><div class="border-top mt-4 pt-3"><div class="small fw-semibold mb-2">Patient directory</div><form id="directoryForm" class="d-flex gap-2"><input name="search" class="form-control form-control-sm" placeholder="Search name or email"><button class="btn btn-sm btn-outline-primary">Search</button></form><div id="directoryResults" class="small mt-2"></div></div></div>
-      <div class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">New medication schedule</h2><form id="scheduleForm"><select name="patient_id" class="form-select mb-2" required><option value="">Choose patient</option>${patients.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select><input name="med_name" class="form-control mb-2" placeholder="Medication name" required><div class="row g-2 mb-2"><div class="col"><input name="time" type="time" class="form-control" required></div><div class="col"><input name="compartment" type="number" min="1" max="8" class="form-control" placeholder="Compartment"></div></div><input name="dosage" class="form-control mb-3" placeholder="Dosage" required><button class="btn btn-primary w-100">Sync schedule</button></form></div></div>
+      <div class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">New medication schedule</h2><form id="scheduleForm"><select name="patient_id" class="form-select mb-2" required><option value="">Choose patient</option>${patients.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select><input name="med_name" class="form-control mb-2" placeholder="Medication name" required><div class="row g-2 mb-2"><div class="col"><input name="time" type="time" class="form-control" required></div><div class="col"><input name="compartment" type="number" min="1" max="8" class="form-control" placeholder="Compartment"></div></div><input name="dosage" class="form-control mb-2" placeholder="Dosage" required><div class="row g-2 mb-2"><div class="col"><label class="form-label small">Tablet g</label><input name="tablet_weight" type="number" min=".01" step=".01" value=".5" class="form-control"></div><div class="col"><label class="form-label small">Quantity</label><input name="expected_quantity" type="number" min="1" max="100" value="1" class="form-control"></div><div class="col"><label class="form-label small">Tolerance g</label><input name="tolerance" type="number" min=".01" step=".01" value=".2" class="form-control"></div></div><div class="row g-2 mb-3"><div class="col"><label class="form-label small">Response min</label><input name="response_window_minutes" type="number" min="1" max="1440" value="30" class="form-control"></div><div class="col"><label class="form-label small">Calibration g</label><input name="calibration_offset" type="number" step=".01" value="0" class="form-control"></div><div class="col"><label class="form-label small">Noise g</label><input name="noise_threshold" type="number" min=".01" step=".01" value=".15" class="form-control"></div></div><button class="btn btn-primary w-100">Sync schedule</button></form></div></div>
     <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
   $('#linkPatientForm').onsubmit = async (event) => { event.preventDefault(); try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify(formData(event.target))}); notify('Patient linked'); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#scheduleForm').onsubmit = async (event) => { event.preventDefault(); const values = formData(event.target); try { await api(`/api/doctor/patients/${values.patient_id}/schedules`, {method:'POST', body: JSON.stringify(values)}); notify('Schedule synced to patient'); event.target.reset(); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
