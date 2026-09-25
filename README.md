@@ -100,19 +100,35 @@ $env:SMTP_PASSWORD = "gmail-app-password"
 from an authorized doctor, patient, or caregiver and reports whether delivery
 used TextBee, SMTP, or the in-app fallback.
 
-## AIML adherence risk
+## Phase 3: explainable adherence ML
 
-Install the additional dependencies from `requirements.txt`. The application
-trains a deterministic `RandomForestClassifier` on startup in `model.py`, then
-uses each patient's recent 30-day `PillLog` history and active reminder times
-to calculate a non-adherence probability. The feature vector is
-`[hour_of_day, past_missed_doses, response_delay_minutes]`.
+The adherence model predicts whether the next scheduled dose will be missed.
+Because real labelled histories are not available, `model.py` generates a
+deterministic synthetic dataset with varied schedules, patient tendencies,
+response delays and missed doses. For each upcoming dose, features use only
+earlier observations: schedule hour, prior dose count, prior missed rate,
+recent missed count, average response delay and schedule variability. The
+training/test split is chronological (80/20), and training reports confusion
+matrix, precision, recall, F1 and ROC-AUC alongside a majority-class baseline.
+
+The trained preprocessing pipeline and Random Forest are saved as
+`instance/adherence_model.joblib` (or `ADHERENCE_MODEL_PATH`). Model metadata
+includes the version, data source, split boundaries, feature names, history
+requirement and validation limitations. The model is reproducible with seed
+42, but synthetic metrics are not clinical accuracy measurements.
 
 Authorized doctors, caregivers, and patients can request:
 
 `GET /api/aiml/risk/<patient_id>`
 
-The response is `{ "patient_id": 1, "risk_score": 82.5, "level": "HIGH" }`.
+The response includes `risk_score`, `level`, `historical_factors`,
+`model_version`, `data_source`, `history_count`, and
+`validation_limitations`. With fewer than three historical dose logs it
+returns `INSUFFICIENT_DATA` rather than inventing a prediction.
+
+`GET /api/aiml/model` returns the training/evaluation metadata. These
+predictions are advisory research outputs only; they never override dose
+safety rules, alarm timeouts, or manual confirmation.
 Doctor and caregiver dashboards include the same score as a color-coded risk
 badge.
 

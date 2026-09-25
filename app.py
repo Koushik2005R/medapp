@@ -28,7 +28,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
-from model import predict_risk, risk_level, train_model
+from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
 
 
 class Base(DeclarativeBase):
@@ -442,8 +442,7 @@ def get_patient(patient_id: Any) -> User | None:
 
 
 def risk_payload(patient_id: int) -> dict[str, Any]:
-    score = predict_risk(patient_id)
-    return {"risk_score": score, "level": risk_level(score)}
+    return predict_explanation(patient_id)
 
 
 def can_access_patient(user: User, patient: User) -> bool:
@@ -884,6 +883,11 @@ def register_routes(app: Flask) -> None:
         if not allowed:
             return json_error("You do not have access to this patient's risk", 403)
         return jsonify({"patient_id": patient_id, **risk_payload(patient_id)})
+
+    @app.get("/api/aiml/model")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def adherence_model_info():
+        return jsonify(model_metadata())
 
     @app.get("/api/doctor/patients")
     @role_required("Doctor")
