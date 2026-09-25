@@ -21,7 +21,7 @@ from typing import Any, Callable, TypeVar
 
 from flask import Flask, jsonify, render_template, request, session
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import predict_risk, risk_level, train_model
@@ -90,6 +90,7 @@ class Reminder(db.Model):
     dosage: Mapped[str] = mapped_column(db.String(100), nullable=False)
     set_by_role: Mapped[str] = mapped_column(db.String(20), nullable=False)
     status: Mapped[str] = mapped_column(db.String(20), nullable=False, default="Active")
+    compartment: Mapped[int | None] = mapped_column(db.Integer)
 
     patient: Mapped[User] = relationship(back_populates="reminders", foreign_keys=[patient_id])
 
@@ -102,6 +103,7 @@ class Reminder(db.Model):
             "dosage": self.dosage,
             "set_by_role": self.set_by_role,
             "status": self.status,
+            "compartment": self.compartment,
         }
 
 
@@ -204,6 +206,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        if db.engine.dialect.name == "sqlite":
+            reminder_columns = {
+                column["name"]
+                for column in db.session.execute(db.text("PRAGMA table_info(reminders)")).mappings()
+            }
+            if "compartment" not in reminder_columns:
+                db.session.execute(db.text("ALTER TABLE reminders ADD COLUMN compartment INTEGER"))
+                db.session.commit()
         train_model()
 
     register_routes(app)
@@ -562,6 +572,28 @@ def register_routes(app: Flask) -> None:
             }
         )
 
+    @app.get("/api/doctor/directory")
+    @role_required("Doctor")
+    def doctor_directory():
+        query = request.args.get("search", "").strip().lower()
+        statement = db.select(User).where(User.role == "Patient").order_by(User.name)
+        if query:
+            statement = statement.where(
+                or_(User.email.ilike(f"%{query}%"), User.name.ilike(f"%{query}%"))
+            )
+        patients = db.session.scalars(statement.limit(100)).all()
+        return jsonify(
+            {
+                "patients": [
+                    {
+                        **user_summary(patient),
+                        "linked_to_doctor": patient.linked_doctor_id == current_user().id,
+                        "assigned_doctor_id": patient.linked_doctor_id,
+                    }
+                    for patient in patients
+                ]
+            }
+        )
     @app.post("/api/doctor/patients/link")
     @role_required("Doctor")
     def link_patient():
@@ -608,6 +640,12 @@ def register_routes(app: Flask) -> None:
         patient = get_patient(patient_id)
         data = request.get_json(silent=True) or {}
         med_name, reminder_time, dosage = data.get("med_name"), data.get("time"), data.get("dosage")
+        compartment = data.get("compartment")
+        if isinstance(compartment, str) and compartment.strip():
+            try:
+                compartment = int(compartment)
+            except ValueError:
+                compartment = None
         can_edit = patient and (
             (actor.role == "Doctor" and patient.linked_doctor_id == actor.id)
             or (actor.role == "Caregiver" and patient.linked_caregiver_id == actor.id)
@@ -616,12 +654,17 @@ def register_routes(app: Flask) -> None:
             return json_error("patient is not assigned to you", 403)
         if not all(isinstance(value, str) and value.strip() for value in (med_name, reminder_time, dosage)):
             return json_error("med_name, time, and dosage are required", 400)
+        if compartment is not None and (
+            not isinstance(compartment, int) or isinstance(compartment, bool) or not 1 <= compartment <= 8
+        ):
+            return json_error("compartment must be an integer from 1 to 8", 400)
         reminder = Reminder(
             patient_id=patient.id,
             med_name=med_name.strip(),
             time=reminder_time.strip(),
             dosage=dosage.strip(),
             set_by_role=actor.role,
+            compartment=compartment,
         )
         db.session.add(reminder)
         db.session.commit()
@@ -686,8 +729,12 @@ def register_routes(app: Flask) -> None:
         patient = get_patient(log.patient_id) if log else None
         if log is None or patient is None or patient.linked_caregiver_id != caregiver.id:
             return json_error("log not found for assigned patient", 404)
+        data = request.get_json(silent=True) or {}
+        reason = data.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return json_error("override reason is required", 400)
         log.status = "Manual Override"
-        log.remarks = "Confirmed taken by caregiver"
+        log.remarks = reason.strip()
         db.session.commit()
         return jsonify({"status": "success", "log": log.to_dict()})
 

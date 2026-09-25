@@ -9,16 +9,16 @@
   <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
 </head>
 <body>
-  <nav class="navbar navbar-expand-lg bg-white border-bottom">
-    <div class="container"><a class="navbar-brand fw-bold text-primary" href="#">PillGuard</a>
-      <div class="d-flex align-items-center gap-3"><span id="userLabel" class="text-secondary small"></span><button id="logoutBtn" class="btn btn-outline-secondary btn-sm d-none">Log out</button></div>
+  <nav class="navbar navbar-expand-lg app-nav sticky-top">
+    <div class="container"><a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="#"><span class="brand-mark">+</span><span>PillGuard</span></a>
+      <div class="d-flex align-items-center gap-2"><button id="themeToggle" class="btn btn-sm btn-ghost" type="button" title="Toggle theme">☾</button><button id="aboutBtn" class="btn btn-sm btn-ghost" type="button">About system</button><span id="userLabel" class="text-secondary small ms-2"></span><button id="logoutBtn" class="btn btn-outline-secondary btn-sm d-none">Log out</button></div>
     </div>
   </nav>
   <main class="container py-4">
     <div id="toast" class="alert d-none" role="alert"></div>
     <section id="authView" class="row justify-content-center">
       <div class="col-lg-5"><div class="card border-0 shadow-sm p-4">
-        <h1 class="h3 mb-1">Medication care, connected.</h1><p class="text-secondary mb-4">Sign in to your role dashboard.</p>
+        <p class="eyebrow mb-2">SMART HEALTHCARE PLATFORM</p><h1 class="h3 mb-1">Medication care, connected.</h1><p class="text-secondary mb-4">Cognitive care with weight-based detection.</p>
         <form id="loginForm"><label class="form-label">Email</label><input name="email" type="email" class="form-control mb-3" required>
           <label class="form-label">Password</label><input name="password" type="password" class="form-control mb-3" required>
           <button class="btn btn-primary w-100">Sign in</button>
@@ -40,6 +40,8 @@
       <div id="doctorView" class="d-none"></div><div id="patientView" class="d-none"></div><div id="caregiverView" class="d-none"></div>
     </section>
   </main>
+  <footer class="app-footer mt-5"><div class="container py-4"><div class="row g-3"><div class="col-lg-7"><div class="fw-semibold">Smart Pill Box Monitoring System for Cognitive Impairment with Weight-Based Detection</div><div class="small text-secondary mt-1">Lead Developer / Author: Koushik R</div></div><div class="col-lg-5 small text-secondary text-lg-end">Department of Artificial Intelligence and Machine Learning<br>East West Institute of Technology, Bengaluru</div></div></div></footer>
+  <div class="modal fade" id="aboutModal" tabindex="-1" aria-hidden="true"><div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content"><div class="modal-header"><h2 class="modal-title h5">About the system & research</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><p class="text-secondary">A research platform for cognitive impairment monitoring that connects a smart pill box, behavioral risk intelligence, and a multi-role tele-health console.</p><div class="row g-3"><div class="col-md-6"><div class="info-tile"><strong>Sensing</strong><span>HX711 + load cell weight delta detection</span></div></div><div class="col-md-6"><div class="info-tile"><strong>Control</strong><span>ESP32 with RTC DS3231 medication timing</span></div></div><div class="col-md-6"><div class="info-tile"><strong>Connectivity</strong><span>Flask REST API, SQLite, Jitsi and alerts</span></div></div><div class="col-md-6"><div class="info-tile"><strong>Presentation</strong><span>Responsive Doctor, Patient and Caregiver portals</span></div></div></div><hr><h3 class="h6">Hardware specification</h3><p class="small text-secondary mb-0">ESP32 · HX711 amplifier · Load Cell · RTC DS3231</p><h3 class="h6 mt-3">Performance metrics</h3><p class="small text-secondary mb-0">2.0g intake threshold · real-time dashboard polling · Random Forest adherence-risk scoring · SQLite event persistence.</p></div></div></div></div>
   <div class="modal fade" id="alarmModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered"><div class="modal-content border-danger">
       <div class="modal-header bg-danger text-white"><h2 class="modal-title h5">Medication reminder</h2></div>
