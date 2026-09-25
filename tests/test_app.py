@@ -68,6 +68,17 @@ def test_device_must_match_patient(tmp_path):
     assert response.status_code == 200
 
 
+def test_sensor_model_metadata_requires_authentication(tmp_path):
+    app = make_app(tmp_path)
+    seed(app)
+    client = app.test_client()
+    assert client.get("/api/sensor/model").status_code == 401
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = client.get("/api/sensor/model")
+    assert response.status_code == 200
+    assert {"precision", "recall", "f1", "validation_limitations"} <= response.get_json().keys()
+
+
 def test_weight_event_validates_and_records(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, device_key = seed(app)
@@ -83,6 +94,7 @@ def test_weight_event_validates_and_records(tmp_path):
     )
     assert response.status_code == 200
     assert response.get_json()["state"] == "REMOVAL_DETECTED"
+    assert {"threshold_detection", "anomaly_detection"} <= response.get_json()["sensor_analysis"].keys()
 
 
 def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):

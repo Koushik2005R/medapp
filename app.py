@@ -29,6 +29,7 @@ from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
+from sensor_analysis import analyze_readings, evaluate_sensor_model
 
 
 class Base(DeclarativeBase):
@@ -627,15 +628,15 @@ def process_sensor_reading(
     samples_before: list[float] | None = None,
     samples_after: list[float] | None = None,
     when: datetime | None = None,
-) -> tuple[DoseEvent, PillLog | None]:
+) -> tuple[DoseEvent, PillLog | None, dict[str, Any]]:
     now = when or utc_now()
     event = get_or_create_dose_event(patient, reminder, now, source)
     if event.state in {"MISSED", "MANUALLY_CONFIRMED"} or event.completed_at:
-        return event, db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id))
+        return event, db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)), {}
     if event.state in {"AWAITING_CONFIRMATION", "REMOVAL_DETECTED"} and event.filtered_delta is not None:
-        return event, None
+        return event, None, {}
     if expire_event(event, now):
-        return event, None
+        return event, None, {}
     def clean_samples(values: list[float] | None, fallback: float) -> list[float]:
         if not values:
             return [fallback]
@@ -647,6 +648,14 @@ def process_sensor_reading(
 
     before_value = median(clean_samples(samples_before, before)) + reminder.calibration_offset
     after_value = median(clean_samples(samples_after, after)) + reminder.calibration_offset
+    readings = clean_samples(samples_before, before) + clean_samples(samples_after, after)
+    sensor_analysis = analyze_readings(
+        readings,
+        reminder.tablet_weight * reminder.expected_quantity,
+        reminder.tolerance,
+        reminder.calibration_offset,
+        reminder.noise_threshold,
+    )
     delta = before_value - after_value
     event.initial_weight = before_value
     event.final_weight = after_value
@@ -659,7 +668,7 @@ def process_sensor_reading(
     if abs(delta - expected) <= reminder.tolerance:
         event.state = "REMOVAL_DETECTED"
         event.verification_method = "calibrated_weight_delta"
-    return event, None
+    return event, None, sensor_analysis
 
 
 def alarm_key(patient_id: int, reminder_id: int, when: datetime) -> str:
@@ -774,7 +783,7 @@ def register_routes(app: Flask) -> None:
         reminder = reminder_for_input(patient_id, data.get("reminder_id"), data.get("compartment"))
         if reminder is None:
             return json_error("an active medication schedule is required", 409)
-        event, pill_log = process_sensor_reading(
+        event, pill_log, sensor_analysis = process_sensor_reading(
             device_patient_user, reminder, float(w_before), float(w_after), "hardware",
             data.get("samples_before"), data.get("samples_after"),
         )
@@ -785,6 +794,7 @@ def register_routes(app: Flask) -> None:
                 "status": "success",
                 "state": event.state,
                 "event": event.to_dict(),
+                "sensor_analysis": sensor_analysis,
                 "log": pill_log.to_dict() if pill_log else None,
             }
         ), 200
@@ -815,7 +825,7 @@ def register_routes(app: Flask) -> None:
         )
         if existing_event is None:
             return json_error("acknowledge the medication alarm before simulating", 409)
-        event, pill_log = process_sensor_reading(
+        event, pill_log, sensor_analysis = process_sensor_reading(
             patient, reminder, float(w_before), float(w_after), "simulation",
             data.get("samples_before"), data.get("samples_after"),
         )
@@ -826,6 +836,7 @@ def register_routes(app: Flask) -> None:
             "state": event.state,
             "event": event.to_dict(),
             "delta_weight": event.filtered_delta,
+            "sensor_analysis": sensor_analysis,
             "risk": risk_payload(patient.id),
             "log": pill_log.to_dict() if pill_log else None,
         }), 200
@@ -888,6 +899,11 @@ def register_routes(app: Flask) -> None:
     @role_required("Doctor", "Patient", "Caregiver")
     def adherence_model_info():
         return jsonify(model_metadata())
+
+    @app.get("/api/sensor/model")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def sensor_model_info():
+        return jsonify(evaluate_sensor_model())
 
     @app.get("/api/doctor/patients")
     @role_required("Doctor")
@@ -1263,10 +1279,11 @@ def register_routes(app: Flask) -> None:
             return json_error("unknown simulation scenario", 400)
         now = utc_now()
         event = get_or_create_dose_event(patient, reminder, now, "simulation")
+        sensor_analysis = {}
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
             return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})
         event.acknowledged_at = now
-        event.state = "AWAITING_CONFIRMATION"
+        event.state = "ALERTING"
         expected = reminder.tablet_weight * reminder.expected_quantity
         if scenario == "no_response":
             event.due_at = now - timedelta(minutes=reminder.response_window_minutes + 1)
@@ -1280,14 +1297,15 @@ def register_routes(app: Flask) -> None:
                 before, after = 100.0, 99.95
             elif scenario == "unexpected_weight":
                 before, after = 100.0, 100.0 - expected - (reminder.tolerance * 3)
-            process_sensor_reading(
+            _, _, sensor_analysis = process_sensor_reading(
                 patient, reminder, before, after, "simulation",
                 [before, before + 0.03, before - 0.02],
                 [after, after + 0.02, after - 0.01],
                 now,
             )
         db.session.commit()
-        return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})
+        return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict(),
+                        "sensor_analysis": sensor_analysis})
 
     @app.post("/api/notify/alert")
     @role_required("Doctor", "Patient", "Caregiver")

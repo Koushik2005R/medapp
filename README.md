@@ -132,6 +132,26 @@ safety rules, alarm timeouts, or manual confirmation.
 Doctor and caregiver dashboards include the same score as a color-coded risk
 badge.
 
+## Phase 4: intelligent weight-sensor analysis
+
+`sensor_analysis.py` is the shared analysis layer for simulated and future
+physical load-cell readings. It provides a configurable Gaussian noise/drift
+generator, rolling median filtering, calibration offsets, and window features:
+weight change, variance, stability, duration, and change rate.
+
+An Isolation Forest is trained and evaluated on deterministic synthetic
+normal, removal, unexpected-increase, excessive-removal, and unstable-signal
+scenarios. `GET /api/sensor/model` reports precision, recall, F1, data source,
+and validation limitations. The simulator response includes raw and filtered
+series, threshold classification, anomaly score, and side-by-side threshold
+versus ML results. The UI plots both raw and filtered readings.
+
+Threshold detection answers whether a calibrated medication-removal condition
+was met. The Isolation Forest flags unusual signal windows independently.
+An anomaly is not a confirmed removal, and a detected removal is not proof of
+consumption. Both are advisory synthetic-sensor analyses and do not override
+alarm, response-window, or manual-confirmation safety rules.
+
 ## Phase 2: medication monitoring simulator
 
 The Doctor, Caregiver, and Patient portals include a live software simulator
