@@ -29,7 +29,7 @@ from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
-from sensor_analysis import analyze_readings, evaluate_sensor_model
+from sensor_analysis import analyze_readings, demo_sensor_analyses, evaluate_sensor_model
 
 
 class Base(DeclarativeBase):
@@ -905,6 +905,15 @@ def register_routes(app: Flask) -> None:
     def sensor_model_info():
         return jsonify(evaluate_sensor_model())
 
+    @app.get("/api/sensor/demo")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def sensor_demo():
+        return jsonify({
+            "data_source": "synthetic demo scenarios",
+            "validation_limitations": "Synthetic signals are not representative of calibrated physical hardware.",
+            "scenarios": demo_sensor_analyses(),
+        })
+
     @app.get("/api/doctor/patients")
     @role_required("Doctor")
     def doctor_patients():
@@ -1130,6 +1139,7 @@ def register_routes(app: Flask) -> None:
             {
                 "doctor": user_summary(patient.doctor) if patient.doctor else None,
                 "caregiver": user_summary(patient.caregiver) if patient.caregiver else None,
+                "risk": risk_payload(patient.id),
                 "schedules": [r.to_dict() for r in patient.reminders if r.status == "Active"],
                 "logs": [log.to_dict() for log in logs],
             }

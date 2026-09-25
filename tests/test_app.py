@@ -79,6 +79,29 @@ def test_sensor_model_metadata_requires_authentication(tmp_path):
     assert {"precision", "recall", "f1", "validation_limitations"} <= response.get_json().keys()
 
 
+def test_all_role_dashboards_remain_available(tmp_path):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    with app.app_context():
+        caregiver = User(
+            name="Caregiver", email="c@example.com", role="Caregiver",
+            password_hash="",
+        )
+        caregiver.set_password("password123")
+        db.session.add(caregiver)
+        db.session.flush()
+        db.session.get(User, patient_id).linked_caregiver_id = caregiver.id
+        db.session.commit()
+    for email, endpoint in (
+        ("doctor@example.com", "/api/doctor/patients"),
+        ("patient@example.com", "/api/patient/dashboard"),
+        ("c@example.com", "/api/caregiver/dashboard"),
+    ):
+        client = app.test_client()
+        assert client.post("/api/login", json={"email": email, "password": "password123"}).status_code == 200
+        assert client.get(endpoint).status_code == 200
+
+
 def test_weight_event_validates_and_records(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, device_key = seed(app)

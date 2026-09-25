@@ -132,6 +132,13 @@ safety rules, alarm timeouts, or manual confirmation.
 Doctor and caregiver dashboards include the same score as a color-coded risk
 badge.
 
+The redesigned dashboards are responsive across patient, doctor, and caregiver
+roles. They include actual recorded-event adherence charts where available,
+next-dose countdowns, loading/error/empty states, and an AI Lab with model
+metrics, confusion matrix, feature influence, and sensor-analysis comparisons.
+Synthetic sensor examples are explicitly labelled; no chart presents synthetic
+data as a patient measurement.
+
 ## Phase 4: intelligent weight-sensor analysis
 
 `sensor_analysis.py` is the shared analysis layer for simulated and future

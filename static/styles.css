@@ -8,6 +8,22 @@ body { background: #f4f7fb; color: #172033; font-family: Inter, ui-sans-serif, s
 .card, .modal-content { border: 1px solid rgba(148,163,184,.18) !important; box-shadow: 0 14px 45px rgba(30,64,175,.08); }
 .eyebrow { color: #667085; font-size: .72rem; font-weight: 700; letter-spacing: .12em; }
 .metric { font-size: 1.8rem; font-weight: 700; }
+.metric-card { height: 100%; padding: 1rem; border: 1px solid rgba(37,99,235,.12); border-radius: .8rem; background: rgba(37,99,235,.04); }
+.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; }
+.metric-grid .metric-card { padding: .65rem; }
+.chart-bars { height: 150px; display: flex; align-items: end; gap: .35rem; padding: .5rem 0; border-bottom: 1px solid #cbd5e1; }
+.chart-column { flex: 1; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: end; gap: .2rem; min-width: 0; }
+.chart-value, .chart-label { font-size: .65rem; color: #667085; }
+.chart-track { width: min(26px, 80%); min-height: 8px; display: flex; flex-direction: column; border-radius: .3rem .3rem 0 0; overflow: hidden; background: #e2e8f0; }
+.chart-taken { background: #16a34a; }
+.chart-missed { background: #dc3545; }
+.confusion-matrix { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 2px; font-size: .75rem; text-align: center; }
+.confusion-matrix > * { padding: .45rem; background: rgba(37,99,235,.06); }
+.importance-row { display: grid; grid-template-columns: 10rem 1fr 3rem; gap: .5rem; align-items: center; margin: .45rem 0; font-size: .75rem; }
+.importance-bar { height: .5rem; border-radius: 1rem; background: #e2e8f0; overflow: hidden; }
+.importance-bar i { display: block; height: 100%; background: linear-gradient(90deg,#2563eb,#10b981); }
+.sensor-scenario { display: grid; grid-template-columns: 1fr auto auto; gap: .35rem; align-items: center; padding: .5rem 0; border-bottom: 1px solid rgba(148,163,184,.2); font-size: .75rem; }
+.loading-block { min-height: 6rem; display: grid; place-items: center; color: #667085; background: rgba(148,163,184,.08); border-radius: .75rem; }
 .provider-banner { background: linear-gradient(115deg, #1456d9, #4c86ed); color: #fff; border-radius: 1rem; }
 .schedule-time { font-size: 1.45rem; font-weight: 700; color: #1456d9; }
 .status-dot { width: .55rem; height: .55rem; display: inline-block; border-radius: 50%; background: #20b26b; }
@@ -38,3 +54,6 @@ body { background: #f4f7fb; color: #172033; font-family: Inter, ui-sans-serif, s
 [data-theme="dark"] .text-secondary, [data-theme="dark"] .small { color: #9fb0c9 !important; }
 [data-theme="dark"] .form-control, [data-theme="dark"] .form-select { background: #0b1220; color: #e5edf8; border-color: #334155; }
 [data-theme="dark"] .pill-compartment { background: #172338; border-color: #334155; }
+[data-theme="dark"] .metric-card, [data-theme="dark"] .loading-block, [data-theme="dark"] .sensor-graph { background: rgba(148,163,184,.1); }
+[data-theme="dark"] .chart-track, [data-theme="dark"] .importance-bar { background: #334155; }
+@media (max-width: 768px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .importance-row { grid-template-columns: 7rem 1fr 2.5rem; } .sensor-scenario { grid-template-columns: 1fr auto; } .sensor-scenario small { grid-column: 1 / -1; } }

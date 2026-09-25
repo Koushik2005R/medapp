@@ -137,6 +137,13 @@ def train_model() -> Pipeline:
         "test_start": timestamps[split].isoformat(),
         "evaluation": _metrics(test_y, probabilities),
         "baseline": _metrics(test_y, np.full(len(test_y), majority_probability), baseline=True),
+        "feature_importance": {
+            name: round(float(value), 4)
+            for name, value in zip(
+                FEATURE_NAMES,
+                pipeline.named_steps["classifier"].feature_importances_,
+            )
+        },
     }
     artifact = {"pipeline": pipeline, "metadata": metadata}
     path = model_path()
@@ -150,6 +157,8 @@ def _load_model() -> None:
     global _model, _metadata
     try:
         artifact = joblib.load(model_path())
+        if artifact["metadata"].get("model_version") != MODEL_VERSION or "feature_importance" not in artifact["metadata"]:
+            raise ValueError("model artifact requires retraining")
         _model = artifact["pipeline"]
         _metadata = artifact["metadata"]
     except (FileNotFoundError, OSError, KeyError, ValueError, EOFError):

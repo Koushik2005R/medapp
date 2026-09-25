@@ -188,3 +188,20 @@ def evaluate_sensor_model() -> dict[str, Any]:
         "f1": round(float(f1_score(truth, predictions, zero_division=0)), 4),
         "scenarios": ["normal", "removal", "unexpected increase", "unstable/noisy"],
     }
+
+
+def demo_sensor_analyses() -> list[dict[str, Any]]:
+    """Return explicitly labelled synthetic examples for the AI Lab."""
+    scenarios = (
+        ("Stable / no removal", [100.0] * 20, 5.0),
+        ("Normal removal", [100.0] * 12 + [95.0] * 12, 5.0),
+        ("Unexpected increase", [100.0] * 12 + [104.0] * 12, 5.0),
+        ("Unstable readings", generate_sensor_noise(100.0, 24, 0.65, seed=91), 5.0),
+    )
+    return [
+        {
+            "scenario": name,
+            **analyze_readings(readings, expected, 0.3),
+        }
+        for name, readings, expected in scenarios
+    ]
