@@ -1,11 +1,13 @@
-const state = { user: null, timer: null, alarmTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, alarmKeys: new Set(), schedules: [] };
+const state = { user: null, timer: null, alarmTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, alarmKeys: new Set(), schedules: [], csrfToken: '' };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
 document.documentElement.dataset.theme = theme;
 
 async function api(url, options = {}) {
-  const response = await fetch(url, { credentials: 'same-origin', headers: {'Content-Type': 'application/json', ...(options.headers || {})}, ...options });
+  const headers = {'Content-Type': 'application/json', ...(options.headers || {})};
+  if (state.csrfToken && ['POST', 'PUT', 'PATCH', 'DELETE'].includes((options.method || 'GET').toUpperCase())) headers['X-CSRF-Token'] = state.csrfToken;
+  const response = await fetch(url, { credentials: 'same-origin', headers, ...options });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || 'Request failed');
   return data;
@@ -186,7 +188,7 @@ function logRow(log) { const canOverride = log.status === 'Missed'; const label 
 async function dispatchNotification(patients) { if (!patients.length) return notify('No assigned patients', 'warning'); const patient = prompt(`Patient ID (${patients.map(p => `${p.id}: ${p.name}`).join(', ')}):`); const message = prompt('Notification message:'); if (!patient || !message) return; try { await api('/api/caregiver/notify', {method:'POST', body: JSON.stringify({patient_id: Number(patient), message})}); notify('Notification dispatched'); } catch (error) { notify(error.message, 'danger'); } }
 
 async function loadDashboard() { if (state.user.role === 'Doctor') await loadDoctor(); else if (state.user.role === 'Patient') await loadPatient(); else await loadCaregiver(); }
-$('#loginForm').onsubmit = async (event) => { event.preventDefault(); try { const data = await api('/api/login', {method:'POST', body: JSON.stringify(formData(event.target))}); state.user = data.user; shell(state.user.role, state.user.name); await loadDashboard(); state.timer = setInterval(loadDashboard, 10000); } catch (error) { notify(error.message, 'danger'); } };
+$('#loginForm').onsubmit = async (event) => { event.preventDefault(); try { const data = await api('/api/login', {method:'POST', body: JSON.stringify(formData(event.target))}); state.user = data.user; state.csrfToken = (await api('/api/csrf-token')).csrf_token; shell(state.user.role, state.user.name); await loadDashboard(); state.timer = setInterval(loadDashboard, 10000); } catch (error) { notify(error.message, 'danger'); } };
 $('#showSignupBtn').onclick = () => { $('#loginForm').classList.add('d-none'); $('#signupForm').classList.remove('d-none'); $('#showSignupBtn').classList.add('d-none'); };
 $('#showLoginBtn').onclick = () => { $('#signupForm').classList.add('d-none'); $('#loginForm').classList.remove('d-none'); $('#showSignupBtn').classList.remove('d-none'); };
 $('#signupForm').onsubmit = async (event) => {
@@ -201,7 +203,7 @@ $('#signupForm').onsubmit = async (event) => {
     notify('Account created. Sign in to continue.');
   } catch (error) { notify(error.message, 'danger'); }
 };
-$('#logoutBtn').onclick = async () => { await api('/api/logout'); clearInterval(state.timer); clearInterval(state.alarmTimer); stopBuzzer(); state.user = null; $('#dashboardView').classList.add('d-none'); $('#authView').classList.remove('d-none'); $('#logoutBtn').classList.add('d-none'); $('#userLabel').textContent = ''; };
+$('#logoutBtn').onclick = async () => { await api('/api/logout'); clearInterval(state.timer); clearInterval(state.alarmTimer); stopBuzzer(); state.user = null; state.csrfToken = ''; $('#dashboardView').classList.add('d-none'); $('#authView').classList.remove('d-none'); $('#logoutBtn').classList.add('d-none'); $('#userLabel').textContent = ''; };
 $('#themeToggle').onclick = () => { const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = next; localStorage.setItem('pillguard-theme', next); $('#themeToggle').textContent = next === 'dark' ? '☀' : '☾'; };
 $('#themeToggle').textContent = theme === 'dark' ? '☀' : '☾';
 $('#aboutBtn').onclick = () => bootstrap.Modal.getOrCreateInstance($('#aboutModal')).show();

@@ -15,10 +15,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:5000")
     parser.add_argument("--patient-id", type=int, required=True)
+    parser.add_argument("--device-key", required=True)
     args = parser.parse_args()
 
     schedule_url = f"{args.base_url}/api/hardware/get-schedules?patient_id={args.patient_id}"
-    with urlopen(schedule_url, timeout=10) as response:
+    headers = {"X-Device-Key": args.device_key}
+    with urlopen(Request(schedule_url, headers=headers), timeout=10) as response:
         print("Schedules:", response.status, response.read().decode())
 
     payload = json.dumps({
@@ -29,7 +31,7 @@ def main() -> None:
     request = Request(
         f"{args.base_url}/api/hardware/log-event",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
     with urlopen(request, timeout=10) as response:

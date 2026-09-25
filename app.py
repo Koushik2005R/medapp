@@ -4,7 +4,7 @@ Run locally with:
     flask --app app run
 
 The SQLite database is created automatically at the path configured by
-DATABASE_URL (or ``database.db`` in the project directory).
+DATABASE_URL (or ``instance/database.db`` in the project directory).
 """
 
 from __future__ import annotations
@@ -12,6 +12,9 @@ from __future__ import annotations
 import math
 import json
 import os
+import hashlib
+import secrets
+import re
 import smtplib
 import urllib.request
 from datetime import datetime, timezone
@@ -190,13 +193,30 @@ class HardwareTraffic(db.Model):
         }
 
 
+class Device(db.Model):
+    __tablename__ = "devices"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(db.String(120), nullable=False)
+    token_hash: Mapped[str] = mapped_column(db.String(64), unique=True, nullable=False)
+    active: Mapped[bool] = mapped_column(db.Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+
+
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
+    secret_key = os.environ.get("SECRET_KEY")
+    if not secret_key:
+        raise RuntimeError("SECRET_KEY environment variable is required")
     app.config.from_mapping(
-        SECRET_KEY=os.environ.get("SECRET_KEY", "change-this-secret-key"),
+        SECRET_KEY=secret_key,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "").lower() == "true",
         SQLALCHEMY_DATABASE_URI=os.environ.get(
             "DATABASE_URL",
-            f"sqlite:///{os.path.join(app.root_path, 'database.db')}",
+            f"sqlite:///{os.path.join(app.root_path, 'instance', 'database.db')}",
         ),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
     )
@@ -206,22 +226,78 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     db.init_app(app)
     with app.app_context():
         db.create_all()
-        if db.engine.dialect.name == "sqlite":
-            reminder_columns = {
-                column["name"]
-                for column in db.session.execute(db.text("PRAGMA table_info(reminders)")).mappings()
-            }
-            if "compartment" not in reminder_columns:
-                db.session.execute(db.text("ALTER TABLE reminders ADD COLUMN compartment INTEGER"))
-                db.session.commit()
+        migrate_schema()
         train_model()
 
     register_routes(app)
+    register_csrf(app)
     return app
+
+
+def migrate_schema() -> None:
+    """Apply additive SQLite migrations while retaining all existing records."""
+    db.session.execute(db.text(
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
+    ))
+    if db.session.scalar(db.text("SELECT COUNT(*) FROM schema_version")) == 0:
+        db.session.execute(db.text("INSERT INTO schema_version(version) VALUES (0)"))
+    for table, column, definition in (
+        ("reminders", "compartment", "INTEGER"),
+    ):
+        columns = {
+            row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).all()
+        }
+        if column not in columns:
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+    db.session.execute(db.text("UPDATE schema_version SET version = 1"))
+    db.session.commit()
+
+
+def register_csrf(app: Flask) -> None:
+    @app.get("/api/csrf-token")
+    def csrf_token():
+        token = session.get("csrf_token")
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session["csrf_token"] = token
+        return jsonify({"csrf_token": token})
+
+    @app.before_request
+    def validate_csrf():
+        if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return None
+        if not request.path.startswith("/api/") or request.path in {"/api/login", "/api/register"}:
+            return None
+        if request.headers.get("X-Device-Key"):
+            return None
+        expected = session.get("csrf_token")
+        if not expected or not secrets.compare_digest(
+            expected, request.headers.get("X-CSRF-Token", "")
+        ):
+            return json_error("CSRF token missing or invalid", 400)
+        return None
 
 
 def json_error(message: str, status_code: int):
     return jsonify({"error": message}), status_code
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def device_patient() -> User | None:
+    raw_token = request.headers.get("X-Device-Key", "").strip()
+    if not raw_token:
+        return None
+    device = db.session.scalar(
+        db.select(Device).where(Device.token_hash == token_digest(raw_token), Device.active.is_(True))
+    )
+    return db.session.get(User, device.patient_id) if device else None
+
+
+def valid_weight(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)) and 0 <= float(value) <= 100000
 
 
 def login_required(view: F) -> F:
@@ -391,10 +467,14 @@ def register_routes(app: Flask) -> None:
         role = role.title() if isinstance(role, str) else role
         if role not in {"Doctor", "Patient", "Caregiver"}:
             return json_error("role must be Doctor, Patient, or Caregiver", 400)
+        if role == "Doctor" and os.environ.get("ALLOW_PUBLIC_DOCTOR_REGISTRATION", "").lower() != "true":
+            return json_error("doctor registration requires an administrator invitation", 403)
         if len(password) < 8:
             return json_error("password must be at least 8 characters", 400)
 
         normalized_email = email.strip().lower()
+        if len(name.strip()) > 120 or len(normalized_email) > 255 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_email):
+            return json_error("name or email is invalid", 400)
         if db.session.scalar(db.select(User).where(User.email == normalized_email)):
             return json_error("email is already registered", 409)
 
@@ -428,9 +508,12 @@ def register_routes(app: Flask) -> None:
     @app.get("/api/hardware/get-schedules")
     def get_schedules():
         patient_id = request.args.get("patient_id", type=int)
+        device_patient_user = device_patient()
         if patient_id is None or patient_id <= 0:
             return json_error("patient_id must be a positive integer", 400)
-        if db.session.get(User, patient_id) is None:
+        if device_patient_user is None or device_patient_user.id != patient_id:
+            return json_error("valid device authentication is required", 401)
+        if db.session.get(User, patient_id) is None or device_patient_user.role != "Patient":
             return json_error("patient not found", 404)
 
         reminders = db.session.scalars(
@@ -451,11 +534,14 @@ def register_routes(app: Flask) -> None:
         w_after = data.get("w_after")
         if not isinstance(patient_id, int) or isinstance(patient_id, bool) or patient_id <= 0:
             return json_error("patient_id must be a positive integer", 400)
-        if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (w_before, w_after)):
-            return json_error("w_before and w_after must be numbers", 400)
-        if not all(math.isfinite(float(value)) for value in (w_before, w_after)):
-            return json_error("weights must be finite numbers", 400)
-        if db.session.get(User, patient_id) is None:
+        device_patient_user = device_patient()
+        if device_patient_user is None or device_patient_user.id != patient_id:
+            return json_error("valid device authentication is required", 401)
+        if not all(valid_weight(value) for value in (w_before, w_after)):
+            return json_error("weights must be finite numbers from 0 to 100000", 400)
+        if float(w_after) > float(w_before):
+            return json_error("w_after cannot exceed w_before", 400)
+        if db.session.get(User, patient_id) is None or device_patient_user.role != "Patient":
             return json_error("patient not found", 404)
 
         pill_log, alert_delivery = create_pill_log(
@@ -486,12 +572,10 @@ def register_routes(app: Flask) -> None:
             return json_error("You do not have access to this patient", 403)
         if not scheduled_alarm_is_acknowledged(patient.id):
             return json_error("A scheduled medication alarm must be acknowledged before simulation", 409)
-        if not all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value))
-            for value in (w_before, w_after)
-        ):
-            return json_error("w_before and w_after must be finite numbers", 400)
+        if not all(valid_weight(value) for value in (w_before, w_after)):
+            return json_error("weights must be finite numbers from 0 to 100000", 400)
+        if float(w_after) > float(w_before):
+            return json_error("w_after cannot exceed w_before", 400)
         pill_log, alert_delivery = create_pill_log(
             patient.id, float(w_before), float(w_after)
         )
@@ -633,6 +717,32 @@ def register_routes(app: Flask) -> None:
         db.session.commit()
         return jsonify({"status": "success", "caregiver": user_summary(caregiver)})
 
+    @app.post("/api/doctor/patients/<int:patient_id>/devices")
+    @role_required("Doctor")
+    def provision_device(patient_id: int):
+        doctor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or patient.role != "Patient" or patient.linked_doctor_id != doctor.id:
+            return json_error("assigned patient not found", 404)
+        data = request.get_json(silent=True) or {}
+        name = data.get("name", "Pill box")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
+            return json_error("device name is required and must be 120 characters or fewer", 400)
+        token = secrets.token_urlsafe(32)
+        device = Device(
+            patient_id=patient.id,
+            name=name.strip(),
+            token_hash=token_digest(token),
+            created_at=utc_now(),
+        )
+        db.session.add(device)
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "device": {"id": device.id, "patient_id": device.patient_id, "name": device.name, "active": device.active},
+            "device_key": token,
+        }), 201
+
     @app.post("/api/doctor/patients/<int:patient_id>/schedules")
     @role_required("Doctor", "Caregiver")
     def create_schedule(patient_id: int):
@@ -654,6 +764,8 @@ def register_routes(app: Flask) -> None:
             return json_error("patient is not assigned to you", 403)
         if not all(isinstance(value, str) and value.strip() for value in (med_name, reminder_time, dosage)):
             return json_error("med_name, time, and dosage are required", 400)
+        if len(med_name.strip()) > 150 or len(dosage.strip()) > 100 or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reminder_time.strip()):
+            return json_error("med_name, dosage, or time is invalid", 400)
         if compartment is not None and (
             not isinstance(compartment, int) or isinstance(compartment, bool) or not 1 <= compartment <= 8
         ):

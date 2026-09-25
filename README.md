@@ -2,7 +2,8 @@
 
 This project provides the Phase 1 Flask backend for medication schedules, pill
 weight events, and session-based multi-role authentication. SQLite is used by
-default and the database is created automatically on first startup.
+default. Physical ESP32/HX711 and camera verification remain future integrations;
+the current simulator is software-only.
 
 ## Setup
 
@@ -10,12 +11,14 @@ default and the database is created automatically on first startup.
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
-$env:SECRET_KEY = "replace-with-a-long-random-value"
+$env:SECRET_KEY = "generate-a-long-random-value"
 flask --app app run --debug
 ```
 
-The default database is `database.db` in the project directory. Set `DATABASE_URL` to use a
-different SQLAlchemy-supported database URL.
+`SECRET_KEY` is required; the application will not start with a fallback secret.
+The default database is `instance/database.db` (ignored by Git). Set `DATABASE_URL`
+to use a different SQLAlchemy-supported database URL. Additive migrations run at
+startup and preserve existing records.
 
 ## API
 
@@ -31,19 +34,24 @@ curl.exe -c cookies.txt -X POST http://127.0.0.1:5000/api/login `
   -d '{\"email\":\"jane@example.com\",\"password\":\"change-me-123\"}'
 ```
 
-The login session is stored in the Flask session cookie. Use `GET
-/api/logout` to clear it.
+The login session is stored in an HttpOnly, SameSite cookie. Browser API writes
+use the CSRF token returned by `GET /api/csrf-token`. Use `GET /api/logout` to
+clear the session. Public doctor registration is disabled unless
+`ALLOW_PUBLIC_DOCTOR_REGISTRATION=true` is explicitly set.
 
 ### Hardware schedule sync
 
-`GET /api/hardware/get-schedules?patient_id=1` returns only active reminders,
-ordered by medication time.
+Hardware APIs require a device key in `X-Device-Key`. A doctor provisions a
+patient-bound key with `POST /api/doctor/patients/<patient_id>/devices`; the
+returned key is shown only once. `GET /api/hardware/get-schedules?patient_id=1`
+returns only active reminders for that device's assigned patient.
 
 ### Hardware weight event
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:5000/api/hardware/log-event `
   -H "Content-Type: application/json" `
+  -H "X-Device-Key: DEVICE_KEY" `
   -d '{\"patient_id\":1,\"w_before\":100.0,\"w_after\":95.0}'
 ```
 
@@ -119,19 +127,19 @@ requests from `GET /api/hardware/traffic`.
 Useful ESP32/local Wi-Fi checks:
 
 ```powershell
-curl.exe "http://127.0.0.1:5000/api/hardware/get-schedules?patient_id=1"
+curl.exe "http://127.0.0.1:5000/api/hardware/get-schedules?patient_id=1" -H "X-Device-Key: DEVICE_KEY"
 curl.exe -X POST "http://127.0.0.1:5000/api/hardware/log-event" `
   -H "Content-Type: application/json" `
-  -d '{"patient_id":1,"w_before":100.0,"w_after":95.0}'
+  -H "X-Device-Key: DEVICE_KEY" -d '{"patient_id":1,"w_before":100.0,"w_after":95.0}'
 curl.exe -X POST "http://127.0.0.1:5000/api/hardware/log-event" `
   -H "Content-Type: application/json" `
-  -d '{"patient_id":1,"w_before":100.0,"w_after":99.5}'
+  -H "X-Device-Key: DEVICE_KEY" -d '{"patient_id":1,"w_before":100.0,"w_after":99.5}'
 ```
 
 The equivalent Python client is `scripts/hardware_test.py`:
 
 ```powershell
-python scripts/hardware_test.py --patient-id 1
+python scripts/hardware_test.py --patient-id 1 --device-key DEVICE_KEY
 ```
 
 Unified structure:
@@ -140,7 +148,7 @@ Unified structure:
 medapp/
 |-- app.py
 |-- model.py
-|-- database.db                 # created automatically
+|-- instance/database.db       # created automatically; ignored by Git
 |-- requirements.txt
 |-- README.md
 |-- templates/index.html
