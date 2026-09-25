@@ -30,6 +30,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
 from sensor_analysis import analyze_readings, demo_sensor_analyses, evaluate_sensor_model
+from assistant import answer_question
 
 
 class Base(DeclarativeBase):
@@ -913,6 +914,27 @@ def register_routes(app: Flask) -> None:
             "validation_limitations": "Synthetic signals are not representative of calibrated physical hardware.",
             "scenarios": demo_sensor_analyses(),
         })
+
+    @app.post("/api/assistant/chat")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def assistant_chat():
+        actor = current_user()
+        data = request.get_json(silent=True) or {}
+        question = data.get("question")
+        patient_id = data.get("patient_id")
+        if not isinstance(question, str) or not question.strip() or len(question.strip()) > 500:
+            return json_error("question is required and must be 500 characters or fewer", 400)
+        if actor.role == "Patient":
+            patient = actor
+        else:
+            patient = get_patient(patient_id)
+            if patient is None:
+                return json_error("patient_id is required for this role", 400)
+        if not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient's assistant context", 403)
+        return jsonify(answer_question(
+            question, actor, patient, db, Reminder, PillLog, predict_explanation
+        ))
 
     @app.get("/api/doctor/patients")
     @role_required("Doctor")

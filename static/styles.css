@@ -24,6 +24,8 @@ body { background: #f4f7fb; color: #172033; font-family: Inter, ui-sans-serif, s
 .importance-bar i { display: block; height: 100%; background: linear-gradient(90deg,#2563eb,#10b981); }
 .sensor-scenario { display: grid; grid-template-columns: 1fr auto auto; gap: .35rem; align-items: center; padding: .5rem 0; border-bottom: 1px solid rgba(148,163,184,.2); font-size: .75rem; }
 .loading-block { min-height: 6rem; display: grid; place-items: center; color: #667085; background: rgba(148,163,184,.08); border-radius: .75rem; }
+.assistant-response { min-height: 4rem; padding: 1rem; border-radius: .75rem; background: rgba(148,163,184,.08); }
+.assistant-panel [data-assistant-suggestion] { border-radius: 999px; }
 .provider-banner { background: linear-gradient(115deg, #1456d9, #4c86ed); color: #fff; border-radius: 1rem; }
 .schedule-time { font-size: 1.45rem; font-weight: 700; color: #1456d9; }
 .status-dot { width: .55rem; height: .55rem; display: inline-block; border-radius: 50%; background: #20b26b; }

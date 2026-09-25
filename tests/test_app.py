@@ -102,6 +102,47 @@ def test_all_role_dashboards_remain_available(tmp_path):
         assert client.get(endpoint).status_code == 200
 
 
+def test_assistant_is_authorized_grounded_and_csrf_protected(tmp_path):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    with app.app_context():
+        other = User(name="Other", email="other@example.com", role="Patient", password_hash="")
+        other.set_password("password123")
+        db.session.add(other)
+        db.session.commit()
+        other_id = other.id
+    client = app.test_client()
+    assert client.post("/api/assistant/chat", json={"question": "What is my schedule?"}).status_code == 400
+    client.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    assert client.post("/api/assistant/chat", json={"question": "What is the schedule?", "patient_id": patient_id}).status_code == 400
+    response = client.post(
+        "/api/assistant/chat",
+        json={"question": "What is the schedule?", "patient_id": patient_id},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["sources"]
+    assert client.post(
+        "/api/assistant/chat",
+        json={"question": "What is the schedule?", "patient_id": other_id},
+        headers={"X-CSRF-Token": csrf(client)},
+    ).status_code == 403
+
+
+def test_assistant_reports_unsupported_and_insufficient_prediction(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    headers = {"X-CSRF-Token": csrf(client)}
+    unsupported = client.post("/api/assistant/chat", json={"question": "Tell me a joke"}, headers=headers)
+    assert unsupported.status_code == 200
+    assert unsupported.get_json()["intent"] == "unsupported"
+    unavailable = client.post("/api/assistant/chat", json={"question": "What is my risk?"}, headers=headers)
+    assert unavailable.status_code == 200
+    assert "insufficient" in unavailable.get_json()["answer"].lower()
+
+
 def test_weight_event_validates_and_records(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, device_key = seed(app)

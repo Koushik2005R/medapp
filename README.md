@@ -78,6 +78,22 @@ Every portal includes a Jitsi Meet call button. Calls use the public
 `messages` table and are available through `GET /api/messages?patient_id=...`
 and `POST /api/messages`.
 
+## PillGuard AI Assistant (Phase 6)
+
+Each dashboard includes a supplementary assistant at `POST /api/assistant/chat`.
+It uses a deterministic intent router and authorized SQLite queries for active
+schedules, recorded events, missed-dose history, adherence statistics, model
+risk explanations, and supported application features. Patients can ask about
+their own records; doctors and caregivers must select a linked patient. The
+endpoint requires login and the browser CSRF token.
+
+Answers include supporting record dates/IDs where available and explicitly
+report missing history or unsupported questions. The assistant never
+prescribes, changes dosage, treats a weight change as proof of swallowing, or
+overrides medication safety rules. No patient data is sent to an external AI
+provider. Predictions remain advisory synthetic-data research outputs and are
+not clinically validated.
+
 Missed hardware events automatically create an in-app alert. To add delivery
 outside the dashboard, configure either TextBee:
 
