@@ -159,35 +159,55 @@ $env:SMTP_PASSWORD = "gmail-app-password"
 from an authorized doctor, patient, or caregiver and reports whether delivery
 used TextBee, SMTP, or the in-app fallback.
 
-## Phase 3: explainable adherence ML
+## Phase 4: supervised adherence prediction experiment
 
-The adherence model predicts whether the next scheduled dose will be missed.
-Because real labelled histories are not available, `model.py` generates a
-deterministic synthetic dataset with varied schedules, patient tendencies,
-response delays and missed doses. For each upcoming dose, features use only
-earlier observations: schedule hour, prior dose count, prior missed rate,
-recent missed count, average response delay and schedule variability. The
-training/test split is chronological (80/20), and training reports confusion
-matrix, precision, recall, F1 and ROC-AUC alongside a majority-class baseline.
+No consented, clinically labelled medication histories are available. The
+experiment therefore uses explicitly synthetic histories: each synthetic
+patient has a hidden adherence profile and a persistent routine state that
+transitions stochastically. Dose outcomes are sampled from that hidden state,
+not assigned from a weighted formula over the model's input features. The
+default cohort has 64 synthetic patients with 120 daily dose observations each.
+The hidden profiles are sampled as 45% steady, 35% variable and 20% disrupted;
+each profile has distinct stochastic missed-event and routine-state transition
+rates. Only scheduled hour, weekday/weekend and prior recorded outcomes feed
+the model. The generator, seed, cohort size, limitations, and features are
+documented in `model.py`; this is not a substitute for real-world or clinical
+evaluation.
 
-The trained preprocessing pipeline and Random Forest are saved as
-`instance/adherence_model.joblib` (or `ADHERENCE_MODEL_PATH`). Model metadata
-includes the version, data source, split boundaries, feature names, history
-requirement and validation limitations. The model is reproducible with seed
-42, but synthetic metrics are not clinical accuracy measurements.
+Train the imputation + Random Forest pipeline and produce a JSON holdout report:
 
-Authorized doctors, caregivers, and patients can request:
+```powershell
+python scripts/train_adherence_model.py
+python scripts/train_adherence_model.py --seed 42 --patients 64 --doses-per-patient 120
+```
 
-`GET /api/aiml/risk/<patient_id>`
+The reproducible default experiment uses seed 42 and a chronological 80/20
+split by scheduled-dose date. It reports precision, recall, F1, confusion
+matrix, ROC-AUC when both test classes exist, and the same metrics for a
+majority-class baseline. The saved pipeline and metrics are written to
+`instance/adherence_experiment/model.joblib` and
+`instance/adherence_experiment/model.metrics.json` (or use `--model-path`,
+`--report-path`, and `ADHERENCE_MODEL_PATH`). Evaluation figures are the actual
+outputs of the synthetic holdout run; they are not clinical accuracy claims.
 
-The response includes `risk_score`, `level`, `historical_factors`,
-`model_version`, `data_source`, `history_count`, and
-`validation_limitations`. With fewer than three historical dose logs it
-returns `INSUFFICIENT_DATA` rather than inventing a prediction.
+Reference output from the default seed-42 run: the 1,536-row chronological
+test set produced Random Forest precision 0.3925, recall 0.4124, F1 0.4022 and
+ROC-AUC 0.7615. Its confusion matrix (actual rows: on-time, missed; predicted
+columns: on-time, missed) was `[[1246, 113], [104, 73]]`. The majority baseline
+had precision/recall/F1 0.0000 and ROC-AUC 0.5000, with confusion matrix
+`[[1359, 0], [177, 0]]`. These are synthetic engineering results only.
 
-`GET /api/aiml/model` returns the training/evaluation metadata. These
-predictions are advisory research outputs only; they never override dose
-safety rules, alarm timeouts, or manual confirmation.
+`GET /api/aiml/model` returns the saved experiment results and feature
+importance. Authorized doctors, caregivers, and patients can request an
+upcoming-dose estimate using either `GET /api/aiml/prediction/<patient_id>` or
+the compatible `GET /api/aiml/risk/<patient_id>` route. Prediction inputs are
+strictly limited to scheduled-dose details and recorded events timestamped
+before the upcoming dose. Fewer than seven earlier events return
+`INSUFFICIENT_DATA`; patients without an active upcoming schedule return
+`NO_UPCOMING_DOSE`. The AI Insights dashboard shows the prediction, provenance,
+limitations, confusion matrix, baseline comparison, and feature importance.
+Predictions are advisory research outputs and never override medication safety
+rules, alarm timeouts, or manual confirmation.
 Doctor and caregiver dashboards include the same score as a color-coded risk
 badge.
 

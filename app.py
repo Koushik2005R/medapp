@@ -32,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
-from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
+from model import model_metadata, predict_explanation
 from sensor_analysis import analyze_readings, demo_sensor_analyses, evaluate_sensor_model
 from assistant import answer_question
 
@@ -471,7 +471,6 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     with app.app_context():
         if app.config.get("TESTING"):
             db.create_all()
-        train_model()
 
     register_routes(app)
     register_csrf(app)
@@ -1385,6 +1384,7 @@ def register_routes(app: Flask) -> None:
             return json_error("Authenticated user no longer exists", 401)
         return jsonify({"user": user.to_dict()})
 
+    @app.get("/api/aiml/prediction/<int:patient_id>")
     @app.get("/api/aiml/risk/<int:patient_id>")
     @role_required("Doctor", "Patient", "Caregiver")
     def adherence_risk(patient_id: int):
