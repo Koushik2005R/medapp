@@ -8,6 +8,7 @@ from app import (
     DoseEvent,
     HardwareTraffic,
     Medication,
+    MedicationChangeRequest,
     PillLog,
     Reminder,
     SensorEvent,
@@ -293,6 +294,8 @@ def test_landing_auth_and_role_dashboard_page_journeys(tmp_path):
         assert b"AI Insights" in response.data
         assert b"Messages" in response.data
         assert b"Settings" in response.data
+        assert b'id="assistantWidget"' in response.data
+        assert b'id="assistantToggle"' in response.data
         assert role_nav in response.data
     patient_client = app.test_client()
     patient_client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
@@ -305,11 +308,41 @@ def test_assistant_is_authorized_grounded_and_csrf_protected(tmp_path):
     with app.app_context():
         other = User(name="Other", email="other@example.com", role="Patient", password_hash="")
         other.set_password("password123")
-        db.session.add(other)
+        caregiver = User(name="Caregiver", email="c@example.com", role="Caregiver", password_hash="")
+        caregiver.set_password("password123")
+        outsider = User(name="Outsider", email="outsider@example.com", role="Caregiver", password_hash="")
+        outsider.set_password("password123")
+        patient = db.session.get(User, patient_id)
+        db.session.add_all([other, caregiver, outsider])
+        db.session.flush()
+        patient.linked_caregiver_id = caregiver.id
+        change_request = MedicationChangeRequest(
+            patient_id=patient_id,
+            requested_by_id=patient_id,
+            operation="ADD",
+            requested_data={"name": "New medicine"},
+            status="PENDING",
+            created_at=utc_now(),
+        )
+        missed_log = PillLog(
+            patient_id=patient_id,
+            timestamp=utc_now(),
+            initial_weight=100,
+            final_weight=100,
+            delta_weight=0,
+            status="Missed",
+        )
+        db.session.add_all([change_request, missed_log])
         db.session.commit()
         other_id = other.id
+        request_id = change_request.id
     client = app.test_client()
     assert client.post("/api/assistant/chat", json={"question": "What is my schedule?"}).status_code == 400
+    assert client.post(
+        "/api/assistant/chat",
+        json={"question": "What is my schedule?"},
+        headers={"X-CSRF-Token": csrf(client)},
+    ).status_code == 401
     client.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
     assert client.post("/api/assistant/chat", json={"question": "What is the schedule?", "patient_id": patient_id}).status_code == 400
     response = client.post(
@@ -319,10 +352,59 @@ def test_assistant_is_authorized_grounded_and_csrf_protected(tmp_path):
     )
     assert response.status_code == 200
     assert response.get_json()["sources"]
+    assert response.get_json()["intent"] == "schedule"
+    patient_context = client.post(
+        "/api/assistant/chat",
+        json={"question": "What is the schedule?", "patient_id": doctor_id},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert patient_context.status_code == 400
     assert client.post(
         "/api/assistant/chat",
         json={"question": "What is the schedule?", "patient_id": other_id},
         headers={"X-CSRF-Token": csrf(client)},
+    ).status_code == 403
+    navigation = client.post(
+        "/api/assistant/chat",
+        json={"question": "Where do I find medication requests?"},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert navigation.status_code == 200
+    assert navigation.get_json()["intent"] == "navigation"
+    assert "Requests" in navigation.get_json()["answer"]
+    assert client.post(
+        "/api/assistant/chat",
+        json={"question": "What is the request status?", "patient_id": patient_id},
+        headers={"X-CSRF-Token": csrf(client)},
+    ).get_json()["sources"][0]["record_id"] == request_id
+
+    for email, question, expected_intent in (
+        ("patient@example.com", "What is my medication change request status?", "change_requests"),
+        ("patient@example.com", "Show my missed doses", "missed_history"),
+        ("c@example.com", "What is the medication change request status?", "change_requests"),
+        ("c@example.com", "Where do I find assigned patients?", "navigation"),
+    ):
+        role_client = app.test_client()
+        assert role_client.post(
+            "/api/login", json={"email": email, "password": "password123"}
+        ).status_code == 200
+        answer = role_client.post(
+            "/api/assistant/chat",
+            json={"question": question, **({"patient_id": patient_id} if email.startswith("c@") else {})},
+            headers={"X-CSRF-Token": csrf(role_client)},
+        )
+        assert answer.status_code == 200
+        assert answer.get_json()["intent"] == expected_intent
+        if question.startswith("Where"):
+            assert "Assigned Patients" in answer.get_json()["answer"]
+    outsider_client = app.test_client()
+    outsider_client.post(
+        "/api/login", json={"email": "outsider@example.com", "password": "password123"}
+    )
+    assert outsider_client.post(
+        "/api/assistant/chat",
+        json={"question": "Show missed doses", "patient_id": patient_id},
+        headers={"X-CSRF-Token": csrf(outsider_client)},
     ).status_code == 403
 
 
@@ -338,6 +420,35 @@ def test_assistant_reports_unsupported_and_insufficient_prediction(tmp_path):
     unavailable = client.post("/api/assistant/chat", json={"question": "What is my risk?"}, headers=headers)
     assert unavailable.status_code == 200
     assert "insufficient" in unavailable.get_json()["answer"].lower()
+
+
+def test_assistant_enforces_medical_boundary_and_supports_navigation_without_patient_context(tmp_path):
+    app = make_app(tmp_path)
+    seed(app)
+    client = app.test_client()
+    client.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    headers = {"X-CSRF-Token": csrf(client)}
+    advice = client.post(
+        "/api/assistant/chat",
+        json={"question": "Should I change my dose?"},
+        headers=headers,
+    )
+    assert advice.status_code == 200
+    assert advice.get_json()["intent"] == "medical_boundary"
+    assert "cannot advise" in advice.get_json()["answer"]
+    features = client.post(
+        "/api/assistant/chat",
+        json={"question": "What can you help with?"},
+        headers=headers,
+    )
+    assert features.status_code == 200
+    assert features.get_json()["intent"] == "features"
+    needs_context = client.post(
+        "/api/assistant/chat",
+        json={"question": "What is the next dose?"},
+        headers=headers,
+    )
+    assert needs_context.status_code == 400
 
 
 def test_weight_event_validates_and_records(tmp_path):

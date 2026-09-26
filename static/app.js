@@ -1,4 +1,4 @@
-const state = { user: null, timer: null, alarmTimer: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, alarmKeys: new Set(), schedules: [], csrfToken: '' };
+const state = { user: null, timer: null, alarmTimer: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, alarmKeys: new Set(), schedules: [], csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
@@ -263,22 +263,157 @@ function communicationPanel(patients, selectedId = '') {
   const options = patients.map((patient) => `<option value="${patient.id}" ${String(patient.id) === String(selectedId) ? 'selected' : ''}>${esc(patient.name)}</option>`).join('');
   return `<div class="card border-0 shadow-sm p-4 mt-4"><div class="d-flex justify-content-between align-items-center"><h2 class="h5 mb-0">Care team communication</h2><span class="small text-secondary">Secure shared room</span></div><div class="row g-2 mt-2"><div class="col-md-4"><select id="communicationPatient" class="form-select">${options || '<option value="">No patient available</option>'}</select></div><div class="col-md-3"><button id="consultBtn" class="btn btn-primary w-100" ${options ? '' : 'disabled'}>Consult via Call</button></div></div><div class="border rounded-3 p-3 mt-3"><div id="messageList" class="message-list mb-2">${empty('Select a patient to load messages.')}</div><form id="messageForm" class="d-flex gap-2"><input name="message" class="form-control" placeholder="Write a direct message..." maxlength="2000" required><button class="btn btn-outline-primary">Send</button></form></div></div>`;
 }
-function assistantPanel(patients, selectedId = '') {
-  const options = patients.map((patient) => `<option value="${patient.id}" ${String(patient.id) === String(selectedId) ? 'selected' : ''}>${esc(patient.name)}</option>`).join('');
-  return `<section class="card border-0 shadow-sm p-4 mt-4 assistant-panel"><div class="d-flex justify-content-between align-items-start"><div><p class="eyebrow mb-1">PILLGUARD AI ASSISTANT</p><h2 class="h5 mb-1">Ask about recorded care data</h2><p class="small text-secondary mb-0">Database-grounded answers only. No prescribing or dosage changes.</p></div><span class="badge text-bg-light">Supplementary</span></div><div class="d-flex flex-wrap gap-2 mt-3">${['What is the next dose?','Show missed doses','What is the adherence risk?','What can you help with?'].map((question) => `<button class="btn btn-sm btn-outline-primary" data-assistant-suggestion="${esc(question)}">${esc(question)}</button>`).join('')}</div><form id="assistantForm" class="row g-2 mt-2"><div class="col-md-3 ${options ? '' : 'd-none'}"><label class="form-label small">Patient context</label><select id="assistantPatient" class="form-select">${options}</select></div><div class="col-md-7"><label class="form-label small" for="assistantQuestion">Question</label><input id="assistantQuestion" name="question" maxlength="500" class="form-control" placeholder="Ask about a schedule or recorded event" required></div><div class="col-md-2 d-flex align-items-end"><button class="btn btn-primary w-100">Ask assistant</button></div></form><div id="assistantResponse" class="assistant-response mt-3" aria-live="polite">${empty('Your answer and supporting records will appear here.')}</div></section>`;
+function assistantMessage(text, type = 'bot') {
+  const message = document.createElement('div');
+  message.className = `assistant-message assistant-message-${type}`;
+  message.textContent = text;
+  $('#assistantMessages').append(message);
+  $('#assistantMessages').scrollTop = $('#assistantMessages').scrollHeight;
+  return message;
 }
-function bindAssistant(patients, selectedId = '') {
-  const form = $('#assistantForm'); if (!form) return;
-  document.querySelectorAll('[data-assistant-suggestion]').forEach((button) => button.onclick = () => { $('#assistantQuestion').value = button.dataset.assistantSuggestion; form.requestSubmit(); });
-  form.onsubmit = async (event) => {
-    event.preventDefault(); const response = $('#assistantResponse'); response.innerHTML = '<div class="loading-block">Checking authorized records…</div>';
-    try {
-      const values = {question: formData(event.target).question};
-      if ($('#assistantPatient')?.value) values.patient_id = Number($('#assistantPatient').value);
-      const result = await api('/api/assistant/chat', {method:'POST', body: JSON.stringify(values)});
-      response.innerHTML = `<p class="mb-2">${esc(result.answer)}</p>${result.sources.length ? `<div class="small fw-semibold">Supporting records</div><ul class="small mb-0">${result.sources.map((source) => `<li>${esc(source.label)}${source.date ? ` · ${new Date(source.date).toLocaleString()}` : ''}${source.record_id ? ` · record #${source.record_id}` : ''}</li>`).join('')}</ul>` : '<div class="small text-secondary">No supporting records were available.</div>'}`;
-    } catch (error) { response.innerHTML = `<div class="alert alert-warning mb-0">${esc(error.message)}</div>`; }
+function resetAssistantMessages() {
+  $('#assistantMessages').replaceChildren();
+  assistantMessage('Hi! I can help with schedules, recorded events, predictions, request status, and finding your way around PillGuard.');
+}
+function setAssistantContext(patients, selectedId) {
+  const widget = $('#assistantWidget');
+  if (!widget || !state.user) return;
+  const selector = $('#assistantPatient');
+  const context = $('#assistantPatientContext');
+  const isPatient = state.user.role === 'Patient';
+  const options = isPatient ? [] : patients;
+  const optionsKey = options.map((patient) => `${patient.id}:${patient.name}`).join('|');
+  if (!isPatient && selector.dataset.optionsKey !== optionsKey) {
+    selector.replaceChildren();
+    if (!options.length) {
+      selector.add(new Option('No linked patients', ''));
+    } else {
+      options.forEach((patient) => selector.add(new Option(patient.name, String(patient.id))));
+    }
+    selector.dataset.optionsKey = optionsKey;
+  }
+  context.classList.toggle('d-none', isPatient);
+  const previousId = state.assistantPatientId;
+  const preferredId = previousId && options.some((patient) => patient.id === previousId)
+    ? previousId
+    : options.find((patient) => patient.id === Number(selectedId))?.id ?? options[0]?.id ?? null;
+  state.assistantPatientId = isPatient ? state.user.id : preferredId;
+  if (!isPatient && selector.value !== String(preferredId ?? '')) selector.value = String(preferredId ?? '');
+  const contextKey = `${state.user.role}:${state.assistantPatientId ?? 'none'}`;
+  if (state.assistantContextKey && state.assistantContextKey !== contextKey) {
+    state.assistantRequestId += 1;
+    state.assistantController?.abort();
+    state.assistantController = null;
+    $('#assistantSend').disabled = false;
+    $('#assistantQuestion').disabled = false;
+    $('#assistantForm').reset();
+    resetAssistantMessages();
+  }
+  state.assistantContextKey = contextKey;
+  widget.hidden = false;
+}
+function setAssistantOpen(open) {
+  const drawer = $('#assistantDrawer');
+  const toggle = $('#assistantToggle');
+  drawer.hidden = !open;
+  drawer.setAttribute('aria-hidden', String(!open));
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.setAttribute('aria-label', open ? 'Close PillGuard Assistant' : 'Open PillGuard Assistant');
+  $('#assistantWidget').classList.toggle('assistant-open', open);
+  if (open) $('#assistantQuestion').focus();
+  else toggle.focus();
+}
+function renderAssistantResult(message, result) {
+  message.replaceChildren();
+  message.className = 'assistant-message assistant-message-bot';
+  const answer = document.createElement('p');
+  answer.className = 'mb-2';
+  answer.textContent = result.answer;
+  message.append(answer);
+  if (result.sources.length) {
+    const heading = document.createElement('div');
+    heading.className = 'small fw-semibold';
+    heading.textContent = 'Supporting records';
+    const list = document.createElement('ul');
+    list.className = 'small mb-0 ps-3';
+    result.sources.forEach((source) => {
+      const item = document.createElement('li');
+      const date = source.date ? ` · ${new Date(source.date).toLocaleString()}` : '';
+      const record = source.record_id ? ` · record #${source.record_id}` : '';
+      item.textContent = `${source.label}${date}${record}`;
+      list.append(item);
+    });
+    message.append(heading, list);
+  }
+  $('#assistantMessages').scrollTop = $('#assistantMessages').scrollHeight;
+}
+function bindAssistantWidget() {
+  const widget = $('#assistantWidget');
+  if (!widget) return;
+  $('#assistantToggle').onclick = () => setAssistantOpen($('#assistantDrawer').hidden);
+  $('#assistantClose').onclick = () => setAssistantOpen(false);
+  $('#assistantPatient').onchange = () => {
+    const nextId = Number($('#assistantPatient').value) || null;
+    if (nextId === state.assistantPatientId) return;
+    state.assistantPatientId = nextId;
+    state.assistantContextKey = `${state.user.role}:${nextId ?? 'none'}`;
+    state.assistantRequestId += 1;
+    state.assistantController?.abort();
+    state.assistantController = null;
+    $('#assistantSend').disabled = false;
+    $('#assistantQuestion').disabled = false;
+    $('#assistantForm').reset();
+    resetAssistantMessages();
   };
+  document.querySelectorAll('[data-assistant-suggestion]').forEach((button) => {
+    button.onclick = () => {
+      $('#assistantQuestion').value = button.dataset.assistantSuggestion;
+      $('#assistantForm').requestSubmit();
+    };
+  });
+  $('#assistantForm').onsubmit = async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const question = $('#assistantQuestion').value.trim();
+    if (!question) return;
+    const requestId = ++state.assistantRequestId;
+    state.assistantController?.abort();
+    const controller = new AbortController();
+    state.assistantController = controller;
+    assistantMessage(question, 'user');
+    const response = assistantMessage('Checking authorized records…', 'loading');
+    const submit = $('#assistantSend');
+    submit.disabled = true;
+    $('#assistantQuestion').disabled = true;
+    const payload = {question};
+    if (state.user.role !== 'Patient' && state.assistantPatientId) {
+      payload.patient_id = state.assistantPatientId;
+    }
+    try {
+      const result = await api('/api/assistant/chat', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (requestId === state.assistantRequestId) renderAssistantResult(response, result);
+    } catch (error) {
+      if (requestId === state.assistantRequestId) {
+        response.className = 'assistant-message assistant-message-error';
+        response.textContent = error.message;
+      }
+    } finally {
+      if (requestId === state.assistantRequestId) {
+        state.assistantController = null;
+        submit.disabled = false;
+        $('#assistantQuestion').disabled = false;
+        form.reset();
+        $('#assistantQuestion').focus();
+      }
+    }
+  };
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('#assistantDrawer').hidden) setAssistantOpen(false);
+  });
 }
 function bindCommunication(patients, selectedId = '') {
   const selector = $('#communicationPatient');
@@ -422,10 +557,11 @@ function bindDoctorMedicationPanel() {
 async function loadDoctor() {
   const data = await api('/api/doctor/patients'); showOnly('doctorView');
   const patients = data.patients;
+  setAssistantContext(patients, patients[0]?.id);
   $('#doctorView').innerHTML = `<div class="row g-4">
     <div class="col-lg-4"><div class="card border-0 shadow-sm p-4"><h2 class="h5">Add a patient</h2><p class="small text-secondary">Link an existing patient by email.</p><form id="linkPatientForm" class="d-flex gap-2"><input name="email" type="email" class="form-control" placeholder="patient@email.com" required><button class="btn btn-primary">Add</button></form><div class="border-top mt-4 pt-3"><div class="small fw-semibold mb-2">Patient directory</div><form id="directoryForm" class="d-flex gap-2"><input name="search" class="form-control form-control-sm" placeholder="Search name or email"><button class="btn btn-sm btn-outline-primary">Search</button></form><div id="directoryResults" class="small mt-2"></div></div></div>
       <div class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">New medication schedule</h2><form id="scheduleForm"><select name="patient_id" class="form-select mb-2" required><option value="">Choose patient</option>${patients.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select><input name="med_name" class="form-control mb-2" placeholder="Medication name" required><div class="row g-2 mb-2"><div class="col"><input name="time" type="time" class="form-control" required></div><div class="col"><input name="compartment" type="number" min="1" max="8" class="form-control" placeholder="Compartment"></div></div><input name="dosage" class="form-control mb-2" placeholder="Dosage" required><div class="row g-2 mb-2"><div class="col"><label class="form-label small">Tablet g</label><input name="tablet_weight" type="number" min=".01" step=".01" value=".5" class="form-control"></div><div class="col"><label class="form-label small">Quantity</label><input name="expected_quantity" type="number" min="1" max="100" value="1" class="form-control"></div><div class="col"><label class="form-label small">Tolerance g</label><input name="tolerance" type="number" min=".01" step=".01" value=".2" class="form-control"></div></div><div class="row g-2 mb-3"><div class="col"><label class="form-label small">Response min</label><input name="response_window_minutes" type="number" min="1" max="1440" value="30" class="form-control"></div><div class="col"><label class="form-label small">Calibration g</label><input name="calibration_offset" type="number" step=".01" value="0" class="form-control"></div><div class="col"><label class="form-label small">Noise g</label><input name="noise_threshold" type="number" min=".01" step=".01" value=".15" class="form-control"></div></div><button class="btn btn-primary w-100">Sync schedule</button></form></div></div>
-    <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${doctorMedicationPanel(patients)}${activityPanel(patients.flatMap((patient) => (patient.logs || []).map((log) => ({...log, patient_name: patient.name}))).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)), true)}${patients[0] ? aiLabPanel(patients[0].id, patients[0].risk, patients[0].logs) : emptyAiPanel('Link a patient to view their care insights.')}${assistantPanel(patients, patients[0]?.id)}${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
+    <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${doctorMedicationPanel(patients)}${activityPanel(patients.flatMap((patient) => (patient.logs || []).map((log) => ({...log, patient_name: patient.name}))).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)), true)}${patients[0] ? aiLabPanel(patients[0].id, patients[0].risk, patients[0].logs) : emptyAiPanel('Link a patient to view their care insights.')}${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
   $('#linkPatientForm').onsubmit = async (event) => { event.preventDefault(); try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify(formData(event.target))}); notify('Patient linked'); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#scheduleForm').onsubmit = async (event) => { event.preventDefault(); const values = formData(event.target); try { await api(`/api/doctor/patients/${values.patient_id}/schedules`, {method:'POST', body: JSON.stringify(values)}); notify('Schedule synced to patient'); event.target.reset(); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#directoryForm').onsubmit = async (event) => { event.preventDefault(); try { const results = await api(`/api/doctor/directory?search=${encodeURIComponent(formData(event.target).search)}`); $('#directoryResults').innerHTML = results.patients.length ? results.patients.map((p) => `<div class="d-flex justify-content-between align-items-center border-bottom py-2"><span>${esc(p.name)}<br><span class="text-secondary">${esc(p.email)}</span></span>${p.linked_to_doctor ? '<span class="badge text-bg-success">Linked</span>' : `<button data-directory-link="${p.email}" class="btn btn-sm btn-outline-primary">Link</button>`}</div>`).join('') : empty('No patients found.'); document.querySelectorAll('[data-directory-link]').forEach((button) => { button.onclick = async () => { try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify({email: button.dataset.directoryLink})}); notify('Patient linked'); await loadDoctor(); } catch (error) { notify(error.message, 'danger'); } }; }); } catch (error) { notify(error.message, 'danger'); } };
@@ -435,7 +571,6 @@ async function loadDoctor() {
   bindSimulation(patients);
   bindDoctorMedicationPanel();
   if (patients[0]) bindAiLab(patients[0].id);
-  bindAssistant(patients, patients[0]?.id);
   configureAlarms(patients);
   bindSectionNavigation('Doctor');
 }
@@ -482,7 +617,8 @@ async function loadPatient() {
   }
   const doctor = data.doctor;
   const nextReminder = data.next_dose?.reminder;
-  $('#patientView').innerHTML = `<div class="provider-banner p-4 mb-4"><p class="small opacity-75 mb-1">PATIENT OVERVIEW <span class="badge text-bg-light ms-2">Connected account</span></p><h2 class="h4 mb-1">${doctor ? `Dr. ${esc(doctor.name)}` : 'No doctor assigned yet'}</h2><div class="small">${doctor ? esc(doctor.email) : 'Connect with your care team to begin.'}${data.caregiver ? ` · Caregiver: ${esc(data.caregiver.name)} (${esc(data.caregiver.email)})` : ''}</div></div><div id="patientConfirmation"></div>${pillBox(data.schedules, data.logs)}${medicationRecordsPanel(state.user.id, data.medications || [], data.medication_requests || [], true)}<div class="row g-4"><div class="col-lg-7"><div class="card border-0 shadow-sm p-4"><h2 class="h5 mb-3">Medication schedule</h2><div class="row g-3">${data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.')}</div></div></div><div class="col-lg-5"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Next dose</h2><span class="status-dot mt-2"></span></div><div id="nextDoseCountdown" class="metric mt-3">${nextReminder ? esc(nextReminder.time) : '--:--'}</div><p class="text-secondary mb-1">${nextReminder ? `${esc(nextReminder.med_name)} · ${esc(nextReminder.dosage)}` : 'Nothing scheduled'}</p><div class="small text-secondary">Patient time zone: ${esc(data.timezone)} <button id="syncTimezoneBtn" class="btn btn-sm btn-link p-0 ms-1">Use this device's time zone</button></div></div></div></div>${activityPanel(data.logs)}${aiLabPanel(state.user.id, data.risk || {level:'INSUFFICIENT_DATA', historical_factors:[], validation_limitations:'No prediction available.'}, data.logs)}${assistantPanel([{id: state.user.id, name: 'My records'}], state.user.id)}${communicationPanel([{id: state.user.id, name: 'My care team'}], state.user.id)}${simulationPanel([{id: state.user.id, name: 'My account'}], false)}`;
+  $('#patientView').innerHTML = `<div class="provider-banner p-4 mb-4"><p class="small opacity-75 mb-1">PATIENT OVERVIEW <span class="badge text-bg-light ms-2">Connected account</span></p><h2 class="h4 mb-1">${doctor ? `Dr. ${esc(doctor.name)}` : 'No doctor assigned yet'}</h2><div class="small">${doctor ? esc(doctor.email) : 'Connect with your care team to begin.'}${data.caregiver ? ` · Caregiver: ${esc(data.caregiver.name)} (${esc(data.caregiver.email)})` : ''}</div></div><div id="patientConfirmation"></div>${pillBox(data.schedules, data.logs)}${medicationRecordsPanel(state.user.id, data.medications || [], data.medication_requests || [], true)}<div class="row g-4"><div class="col-lg-7"><div class="card border-0 shadow-sm p-4"><h2 class="h5 mb-3">Medication schedule</h2><div class="row g-3">${data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.')}</div></div></div><div class="col-lg-5"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Next dose</h2><span class="status-dot mt-2"></span></div><div id="nextDoseCountdown" class="metric mt-3">${nextReminder ? esc(nextReminder.time) : '--:--'}</div><p class="text-secondary mb-1">${nextReminder ? `${esc(nextReminder.med_name)} · ${esc(nextReminder.dosage)}` : 'Nothing scheduled'}</p><div class="small text-secondary">Patient time zone: ${esc(data.timezone)} <button id="syncTimezoneBtn" class="btn btn-sm btn-link p-0 ms-1">Use this device's time zone</button></div></div></div></div>${activityPanel(data.logs)}${aiLabPanel(state.user.id, data.risk || {level:'INSUFFICIENT_DATA', historical_factors:[], validation_limitations:'No prediction available.'}, data.logs)}${communicationPanel([{id: state.user.id, name: 'My care team'}], state.user.id)}${simulationPanel([{id: state.user.id, name: 'My account'}], false)}`;
+  setAssistantContext([], state.user.id);
   bindCommunication([{id: state.user.id, name: 'My care team'}], state.user.id);
   bindMedicationPanels(state.user.id);
   bindSimulation([{id: state.user.id, name: 'My account', schedules: data.schedules}]);
@@ -497,7 +633,6 @@ async function loadPatient() {
     } catch (error) { notify(error.message, 'danger'); }
   };
   bindAiLab(state.user.id);
-  bindAssistant([{id: state.user.id, name: 'My records'}], state.user.id);
   bindSectionNavigation('Patient');
 }
 function scheduleCard(item) { return `<div class="col-md-6"><div class="border rounded-3 p-3 h-100"><div class="schedule-time">${esc(item.time)}</div><div class="fw-semibold">${esc(item.med_name)}</div><div class="small text-secondary">${esc(item.dosage)} · Set by ${esc(item.set_by_role)}</div></div></div>`; }
@@ -505,7 +640,8 @@ function scheduleCard(item) { return `<div class="col-md-6"><div class="border r
 async function loadCaregiver() {
   const data = await api('/api/caregiver/dashboard'); showOnly('caregiverView');
   const selectedPatient = data.patients[0];
-  $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div>${data.patients.map((patient) => medicationRecordsPanel(patient.id, patient.medications || [], patient.medication_requests || [], true)).join('')}<div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : emptyAiPanel('AI Insights will be available when a patient is assigned.')}${assistantPanel(data.patients, data.patients[0]?.id)}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;
+  setAssistantContext(data.patients, data.patients[0]?.id);
+  $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div>${data.patients.map((patient) => medicationRecordsPanel(patient.id, patient.medications || [], patient.medication_requests || [], true)).join('')}<div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : emptyAiPanel('AI Insights will be available when a patient is assigned.')}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;
   document.querySelectorAll('[data-override]').forEach((button) => button.onclick = async () => { const reason = window.prompt('Why are you confirming this dose?'); if (!reason) return; try { await api(`/api/caregiver/logs/${button.dataset.override}/override`, {method:'POST', body: JSON.stringify({reason})}); stopBuzzer(); notify('Medication marked as taken'); loadCaregiver(); } catch (error) { notify(error.message, 'danger'); } });
   $('#notifyBtn').onclick = () => dispatchNotification(data.patients);
   bindCommunication(data.patients, data.patients[0]?.id);
@@ -513,7 +649,6 @@ async function loadCaregiver() {
   bindSimulation(data.patients);
   configureAlarms(data.patients);
   if (selectedPatient) bindAiLab(selectedPatient.id);
-  bindAssistant(data.patients, data.patients[0]?.id);
   bindSectionNavigation('Caregiver');
 }
 function logRow(log) { const canOverride = log.status === 'Missed'; const label = log.status === 'Taken' ? 'Taken (Weight Verified)' : log.status === 'Manual Override' ? 'Taken (Caregiver Override)' : 'Missed (Timeout)'; return `<tr><td class="fw-semibold">${esc(log.patient_name)}</td><td class="small">${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight).toFixed(1)}g</td><td><span class="badge ${log.status === 'Taken' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${label}</span></td><td>${canOverride ? `<button data-override="${log.id}" class="btn btn-sm btn-outline-success">Mark taken</button>` : ''}</td></tr>`; }
@@ -565,6 +700,7 @@ if (settingsThemeButton) settingsThemeButton.onclick = toggleTheme;
 if (themeButton) themeButton.textContent = theme === 'dark' ? '☀' : '☾';
 const aboutButton = $('#aboutBtn');
 if (aboutButton) aboutButton.onclick = () => bootstrap.Modal.getOrCreateInstance($('#aboutModal')).show();
+bindAssistantWidget();
 if ($('#dashboardView')) {
   api('/api/me').then(async (data) => {
     state.user = data.user;

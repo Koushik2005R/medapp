@@ -24,8 +24,6 @@ body { background: #f4f7fb; color: #172033; font-family: Inter, ui-sans-serif, s
 .importance-bar i { display: block; height: 100%; background: linear-gradient(90deg,#2563eb,#10b981); }
 .sensor-scenario { display: grid; grid-template-columns: 1fr auto auto; gap: .35rem; align-items: center; padding: .5rem 0; border-bottom: 1px solid rgba(148,163,184,.2); font-size: .75rem; }
 .loading-block { min-height: 6rem; display: grid; place-items: center; color: #667085; background: rgba(148,163,184,.08); border-radius: .75rem; }
-.assistant-response { min-height: 4rem; padding: 1rem; border-radius: .75rem; background: rgba(148,163,184,.08); }
-.assistant-panel [data-assistant-suggestion] { border-radius: 999px; }
 .provider-banner { background: linear-gradient(115deg, #1456d9, #4c86ed); color: #fff; border-radius: 1rem; }
 .schedule-time { font-size: 1.45rem; font-weight: 700; color: #1456d9; }
 .status-dot { width: .55rem; height: .55rem; display: inline-block; border-radius: 50%; background: #20b26b; }
@@ -108,4 +106,43 @@ a, button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+.assistant-widget[hidden], .assistant-drawer[hidden] { display: none !important; }
+.assistant-widget { position: fixed; right: 1.5rem; bottom: 1.5rem; z-index: 1040; }
+.assistant-toggle { display: flex; align-items: center; gap: .65rem; min-height: 3.5rem; padding: .65rem 1rem; border: 0; border-radius: 999px; background: linear-gradient(135deg, #2563eb, #0f9f83); color: #fff; box-shadow: 0 .8rem 2rem rgba(37,99,235,.32); font-weight: 700; transition: transform .2s ease, box-shadow .2s ease; }
+.assistant-toggle:hover { transform: translateY(-2px); box-shadow: 0 1rem 2.4rem rgba(37,99,235,.4); }
+.assistant-toggle svg { width: 1.55rem; height: 1.55rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.assistant-drawer { position: absolute; right: 0; bottom: 4.35rem; display: flex; flex-direction: column; width: min(410px, calc(100vw - 2rem)); height: min(650px, calc(100dvh - 8rem)); min-height: 360px; overflow: hidden; border: 1px solid rgba(148,163,184,.28); border-radius: 1.25rem; background: #fff; box-shadow: 0 1.25rem 4rem rgba(15,23,42,.25); animation: assistant-enter .18s ease-out; }
+.assistant-header { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.1rem; background: linear-gradient(115deg, #1456d9, #118d81); color: #fff; }
+.assistant-avatar { display: grid; width: 2.5rem; height: 2.5rem; place-items: center; border: 1px solid rgba(255,255,255,.35); border-radius: 50%; background: rgba(255,255,255,.16); font-size: 1.25rem; }
+.assistant-close { display: grid; width: 2.25rem; height: 2.25rem; place-items: center; border: 0; border-radius: .65rem; background: transparent; color: #fff; font-size: 1.7rem; line-height: 1; }
+.assistant-close:hover { background: rgba(255,255,255,.16); }
+.assistant-context { padding: .75rem 1rem .2rem; border-bottom: 1px solid #e8edf5; }
+.assistant-messages { display: flex; flex: 1; flex-direction: column; gap: .75rem; overflow-y: auto; padding: 1rem; overscroll-behavior: contain; }
+.assistant-message { max-width: 90%; padding: .75rem .9rem; border-radius: 1rem; font-size: .9rem; line-height: 1.5; overflow-wrap: anywhere; }
+.assistant-message-bot { align-self: flex-start; border: 1px solid #e5eaf2; border-bottom-left-radius: .3rem; background: #f5f7fb; color: #263449; }
+.assistant-message-user { align-self: flex-end; border-bottom-right-radius: .3rem; background: #e7efff; color: #153b82; }
+.assistant-message-loading { align-self: flex-start; background: #f5f7fb; color: #667085; font-style: italic; }
+.assistant-message-error { align-self: flex-start; border: 1px solid #fecaca; background: #fff1f2; color: #9f1239; }
+.assistant-prompts { display: flex; gap: .45rem; overflow-x: auto; padding: .6rem .85rem; border-top: 1px solid #edf0f5; scrollbar-width: thin; }
+.assistant-prompts button { flex: 0 0 auto; padding: .35rem .65rem; border: 1px solid #d8e2f2; border-radius: 999px; background: #fff; color: #31578d; font-size: .75rem; }
+.assistant-prompts button:hover { border-color: #2563eb; background: #eff6ff; }
+.assistant-compose { display: flex; gap: .55rem; padding: .75rem .85rem; border-top: 1px solid #edf0f5; }
+.assistant-compose .form-control { min-width: 0; border-radius: .8rem; }
+.assistant-compose .btn { display: grid; flex: 0 0 2.8rem; place-items: center; border-radius: .8rem; }
+.assistant-compose svg { width: 1.2rem; height: 1.2rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.assistant-disclaimer { padding: 0 .9rem .8rem; color: #768397; font-size: .68rem; text-align: center; }
+@keyframes assistant-enter { from { opacity: 0; transform: translateY(.5rem) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+[data-theme="dark"] .assistant-drawer { border-color: #334155; background: #111c30; color: #e5edf8; }
+[data-theme="dark"] .assistant-context, [data-theme="dark"] .assistant-prompts, [data-theme="dark"] .assistant-compose { border-color: #334155; }
+[data-theme="dark"] .assistant-message-bot, [data-theme="dark"] .assistant-message-loading { border-color: #334155; background: #172338; color: #dbe7f7; }
+[data-theme="dark"] .assistant-message-user { background: #203b68; color: #dceaff; }
+[data-theme="dark"] .assistant-prompts button { border-color: #40516c; background: #172338; color: #c5d8f4; }
+[data-theme="dark"] .assistant-message-error { border-color: #7f1d1d; background: #3b1720; color: #fecdd3; }
+[data-theme="dark"] .assistant-disclaimer { color: #9fb0c9; }
+@media (max-width: 575.98px) {
+  .assistant-widget { right: .75rem; bottom: max(.75rem, env(safe-area-inset-bottom)); }
+  .assistant-drawer { right: 0; bottom: 4.25rem; width: calc(100vw - 1.5rem); height: min(620px, calc(100dvh - 7rem)); min-height: min(360px, calc(100dvh - 7rem)); border-radius: 1rem; }
+  .assistant-toggle { min-height: 3.25rem; padding: .55rem .85rem; }
 }

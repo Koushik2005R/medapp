@@ -53,6 +53,42 @@
     </section>
   </main>
   <footer class="app-footer mt-5"><div class="container-fluid px-lg-4 py-4"><div class="row g-3"><div class="col-lg-7"><div class="fw-semibold">PillGuard · Medication care, connected.</div><div class="small text-secondary mt-1">Supporting patients, caregivers and clinicians.</div></div><div class="col-lg-5 small text-secondary text-lg-end">Department of Artificial Intelligence and Machine Learning<br>East West Institute of Technology, Bengaluru</div></div></div></footer>
+  <div id="assistantWidget" class="assistant-widget" hidden>
+    <aside id="assistantDrawer" class="assistant-drawer" aria-labelledby="assistantTitle" aria-hidden="true">
+      <header class="assistant-header">
+        <div class="d-flex align-items-center gap-3">
+          <span class="assistant-avatar" aria-hidden="true">✦</span>
+          <div><h2 id="assistantTitle" class="h6 mb-0">PillGuard Assistant</h2><div class="small opacity-75">Grounded in authorized care records</div></div>
+        </div>
+        <button id="assistantClose" class="assistant-close" type="button" aria-label="Close assistant">×</button>
+      </header>
+      <div id="assistantPatientContext" class="assistant-context d-none">
+        <label for="assistantPatient" class="form-label small mb-1">Patient context</label>
+        <select id="assistantPatient" class="form-select form-select-sm"></select>
+      </div>
+      <div id="assistantMessages" class="assistant-messages" role="log" aria-live="polite" aria-relevant="additions text">
+        <div class="assistant-message assistant-message-bot">Hi! I can help with schedules, recorded events, predictions, request status, and finding your way around PillGuard.</div>
+      </div>
+      <div class="assistant-prompts" aria-label="Suggested questions">
+        <button type="button" data-assistant-suggestion="What is the next dose?">Next dose</button>
+        <button type="button" data-assistant-suggestion="Show missed doses">Missed doses</button>
+        <button type="button" data-assistant-suggestion="What is the adherence risk?">Risk insight</button>
+        <button type="button" data-assistant-suggestion="What is my medication change request status?">Request status</button>
+      </div>
+      <form id="assistantForm" class="assistant-compose">
+        <label class="visually-hidden" for="assistantQuestion">Ask PillGuard Assistant</label>
+        <input id="assistantQuestion" name="question" maxlength="500" class="form-control" placeholder="Ask about your care…" autocomplete="off" required>
+        <button id="assistantSend" class="btn btn-primary" type="submit" aria-label="Send question">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12 20 4l-5 16-3-7-8-1Zm8 1 8-9"/></svg>
+        </button>
+      </form>
+      <div class="assistant-disclaimer">Informational only. Not medical advice; never confirms swallowing.</div>
+    </aside>
+    <button id="assistantToggle" class="assistant-toggle" type="button" aria-label="Open PillGuard Assistant" aria-expanded="false" aria-controls="assistantDrawer">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a8 8 0 0 0-6.9 12l-1 4 4-1A8 8 0 1 0 12 3Z"/><path d="M8 12h.01M12 12h.01M16 12h.01"/></svg>
+      <span class="assistant-toggle-label">Ask PillGuard</span>
+    </button>
+  </div>
   <div class="modal fade" id="aboutModal" tabindex="-1" aria-hidden="true"><div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content"><div class="modal-header"><h2 class="modal-title h5">About PillGuard</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div><div class="modal-body"><p class="text-secondary">A care platform that connects medication schedules, a smart pill box and a multi-role tele-health console.</p><div class="row g-3"><div class="col-md-6"><div class="info-tile"><strong>Sensing</strong><span>Weight-change detection from connected devices</span></div></div><div class="col-md-6"><div class="info-tile"><strong>Care team</strong><span>Shared access for doctors, patients and caregivers</span></div></div></div></div></div></div></div>
   <div class="modal fade" id="alarmModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-hidden="true"><div class="modal-dialog modal-dialog-centered"><div class="modal-content border-danger"><div class="modal-header bg-danger text-white"><h2 class="modal-title h5">Medication reminder</h2></div><div class="modal-body text-center py-4"><div class="alarm-icon mb-3">!</div><p class="h5 mb-1">MEDICATION TIME!</p><p class="mb-0">Please access your Pill Box now.</p><p id="alarmMedication" class="small text-secondary mt-2"></p></div><div class="modal-footer"><button id="acknowledgeAlarmBtn" class="btn btn-danger w-100">Acknowledge Alert</button></div></div></div></div>
   <div class="modal fade" id="caregiverLinkModal" tabindex="-1" aria-hidden="true"><div class="modal-dialog modal-dialog-centered"><div class="modal-content"><div class="modal-header"><h2 class="modal-title h5">Link caregiver</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div><form id="caregiverLinkForm"><div class="modal-body"><input type="hidden" name="patient_id"><label class="form-label">Caregiver email</label><input name="email" type="email" class="form-control" required></div><div class="modal-footer"><button class="btn btn-primary">Link caregiver</button></div></form></div></div></div>

@@ -123,12 +123,13 @@ and `POST /api/messages`.
 
 ## PillGuard AI Assistant (Phase 6)
 
-Each dashboard includes a supplementary assistant at `POST /api/assistant/chat`.
-It uses a deterministic intent router and authorized SQLite queries for active
-schedules, recorded events, missed-dose history, adherence statistics, model
-risk explanations, and supported application features. Patients can ask about
-their own records; doctors and caregivers must select a linked patient. The
-endpoint requires login and the browser CSRF token.
+Each authenticated dashboard includes a floating assistant drawer backed by
+`POST /api/assistant/chat`. It uses a deterministic intent router and
+authorized SQLite queries for active schedules, recorded events, missed-dose
+history, adherence statistics, model risk explanations, medication-change
+request status, and role-specific application navigation. Patients can ask
+about their own records; doctors and caregivers select an assigned patient.
+The endpoint requires login and the browser CSRF token.
 
 Answers include supporting record dates/IDs where available and explicitly
 report missing history or unsupported questions. The assistant never

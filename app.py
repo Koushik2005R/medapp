@@ -1427,15 +1427,29 @@ def register_routes(app: Flask) -> None:
             return json_error("question is required and must be 500 characters or fewer", 400)
         if actor.role == "Patient":
             patient = actor
+        elif patient_id is None:
+            patient = None
         else:
             patient = get_patient(patient_id)
-            if patient is None:
+            if patient is None or patient.role != "Patient":
                 return json_error("patient_id is required for this role", 400)
-        if not can_access_patient(actor, patient):
+        if patient is not None and not can_access_patient(actor, patient):
             return json_error("You do not have access to this patient's assistant context", 403)
-        return jsonify(answer_question(
-            question, actor, patient, db, Reminder, PillLog, predict_explanation
-        ))
+        result = answer_question(
+            question,
+            actor,
+            patient,
+            db,
+            Reminder,
+            PillLog,
+            MedicationChangeRequest,
+            predict_explanation,
+        )
+        if patient is None and result["intent"] not in {
+            "navigation", "features", "unsupported", "medical_boundary",
+        }:
+            return json_error("Select an assigned patient for patient-specific assistant questions", 400)
+        return jsonify(result)
 
     @app.get("/api/doctor/patients")
     @role_required("Doctor")
