@@ -809,6 +809,7 @@ def dispatch_alert(patient: User, message: str) -> str:
         Notification(
             patient_id=patient.id,
             sender_id=sender_id,
+            recipient_id=patient.id,
             message=message,
             created_at=utc_now(),
         )
@@ -1066,6 +1067,27 @@ def reminder_for_input(
     return due[0] if len(due) == 1 else None
 
 
+def active_reminder_for_simulation(
+    patient_id: Any,
+    reminder_id: Any,
+    compartment: Any,
+) -> Reminder | None:
+    if not isinstance(patient_id, int) or isinstance(patient_id, bool):
+        return None
+    statement = db.select(Reminder).where(
+        Reminder.patient_id == patient_id,
+        Reminder.status == "Active",
+    )
+    if isinstance(reminder_id, int) and not isinstance(reminder_id, bool):
+        statement = statement.where(Reminder.id == reminder_id)
+    elif isinstance(compartment, int) and not isinstance(compartment, bool):
+        statement = statement.where(Reminder.compartment == compartment)
+    else:
+        return None
+    reminders = db.session.scalars(statement.limit(2)).all()
+    return reminders[0] if len(reminders) == 1 else None
+
+
 def process_sensor_reading(
     patient: User,
     reminder: Reminder,
@@ -1075,9 +1097,12 @@ def process_sensor_reading(
     samples_before: list[float] | None = None,
     samples_after: list[float] | None = None,
     when: datetime | None = None,
+    dose_event: DoseEvent | None = None,
 ) -> tuple[DoseEvent, PillLog | None, dict[str, Any]]:
     now = when or utc_now()
-    event = get_or_create_dose_event(patient, reminder, now, source)
+    if dose_event and (dose_event.patient_id != patient.id or dose_event.reminder_id != reminder.id):
+        raise ValueError("dose event must match the patient and schedule being processed")
+    event = dose_event or get_or_create_dose_event(patient, reminder, now, source)
     if event is None:
         raise ValueError("no scheduled dose is due within its response window")
     if event.state in {"MISSED", "MANUALLY_CONFIRMED"} or event.completed_at:
@@ -2074,6 +2099,7 @@ def register_routes(app: Flask) -> None:
         notification = Notification(
             patient_id=patient.id,
             sender_id=caregiver.id,
+            recipient_id=patient.id,
             message=message.strip(),
             created_at=utc_now(),
         )
@@ -2138,7 +2164,7 @@ def register_routes(app: Flask) -> None:
         actor = current_user()
         data = request.get_json(silent=True) or {}
         patient = get_patient(data.get("patient_id"))
-        reminder = reminder_for_input(
+        reminder = active_reminder_for_simulation(
             data.get("patient_id"), data.get("reminder_id"), data.get("compartment")
         )
         scenario = data.get("scenario")
@@ -2150,9 +2176,8 @@ def register_routes(app: Flask) -> None:
         }:
             return json_error("unknown simulation scenario", 400)
         now = utc_now()
-        event = get_or_create_dose_event(patient, reminder, now, "simulation")
-        if event is None:
-            return json_error("the medication reminder is not due", 409)
+        simulated_at = now.replace(second=30, microsecond=0)
+        event, _ = event_for_occurrence(patient, reminder, simulated_at, "simulation")
         sensor_analysis = {}
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
             return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})
@@ -2194,6 +2219,7 @@ def register_routes(app: Flask) -> None:
                 before_samples,
                 after_samples,
                 now,
+                dose_event=event,
             )
         db.session.commit()
         return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict(),

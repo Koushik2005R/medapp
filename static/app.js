@@ -157,6 +157,16 @@ async function refreshTraffic() {
 function bindSimulation(patients) {
   const patientSelect = $('#scenarioPatient');
   const doseSelect = $('#scenarioReminder');
+  const simulationGate = document.querySelector('[data-simulation-lock]');
+  if (simulationGate && !$('#startSimulationBtn')) {
+    simulationGate.textContent = 'Start a software-only scenario; this does not acknowledge a real medication reminder. ';
+    const startButton = document.createElement('button');
+    startButton.id = 'startSimulationBtn';
+    startButton.type = 'button';
+    startButton.className = 'btn btn-sm btn-outline-primary ms-2';
+    startButton.textContent = 'Start software simulation';
+    simulationGate.append(startButton);
+  }
   const updateDoseChoices = () => {
     const patient = patients.find((item) => String(item.id) === patientSelect.value);
     const schedules = patient?.reminders || patient?.schedules || [];
@@ -219,6 +229,8 @@ function bindSimulation(patients) {
     $('#refreshTrafficBtn').onclick = () => refreshTraffic().catch((error) => notify(error.message, 'danger'));
     refreshTraffic().catch((error) => notify(error.message, 'danger'));
   }
+  const startSimulationButton = $('#startSimulationBtn');
+  if (startSimulationButton) startSimulationButton.onclick = unlockSimulation;
   $('#acknowledgeAlarmBtn').onclick = async () => {
     if (!state.alarm) return;
     try {

@@ -113,6 +113,82 @@ requests. Patients and caregivers can submit medication changes for doctor
 approval. Caregivers receive automatic activity refreshes, can confirm missed
 events manually and dispatch patient notifications.
 
+## Reproducible synthetic demo
+
+Create or refresh an isolated demo database and its matching adherence-model
+artifact:
+
+```powershell
+$env:SECRET_KEY = "demo-only-secret"
+python scripts/demo_setup.py --reset
+$demoDb = (Resolve-Path .\instance\demo.db).Path.Replace("\", "/")
+$env:DATABASE_URL = "sqlite:///$demoDb"
+$env:ADHERENCE_MODEL_PATH = $demoDb.Replace(".db", ".adherence-model.joblib")
+flask --app app run --debug
+```
+
+The reset flag replaces only the selected database file; omit it to re-seed the
+default demo database without clearing it. The demo model and metrics are
+stored beside that database, not in the application's default model location.
+The script resets the three demo account passwords on each run and prints
+account, patient, schedule, and pending-request IDs.
+
+| Role | Demo email | Password |
+|---|---|---|
+| Doctor | `doctor.demo@example.com` | `DemoPass123!` |
+| Patient | `patient.demo@example.com` | `DemoPass123!` |
+| Caregiver | `caregiver.demo@example.com` | `DemoPass123!` |
+
+The linked demo patient has two active schedules, seven deterministic
+synthetic dose outcomes (including missed and manually overridden events),
+two pending medication-removal requests, in-app notifications, messages, and
+enough history for an advisory prediction. The printed device key is for
+hardware-API demonstrations only. The software simulator also has a
+clearly-labeled unlock button so demo scenarios do not require waiting for a
+real-time reminder. Do not use the demo database or credentials for real
+patient information.
+
+### Five-minute demonstration
+
+1. **0:00-0:40 — Sign in as the doctor.** Open `http://127.0.0.1:5000`,
+   sign in with the doctor demo account, and show the linked patient card.
+   Visit Dashboard, Patients, Medications, Activity, AI Insights, Messages,
+   Requests, and Settings from the navigation; unavailable role-specific
+   links are intentionally hidden.
+2. **0:40-1:30 — Review the care plan.** In the medication management panel,
+   edit a demo medication or add a temporary medication schedule. Point out
+   the patient/caregiver link controls and the retained change history.
+3. **1:30-2:20 — Decide requests.** Open Requests, approve one pending removal
+   with the confirmation dialog, then reject the other with a reason. Show the
+   resulting status and notification on the patient account.
+4. **2:20-3:00 — Check the patient view.** Log in as the patient, review the
+   active schedule, missed-dose history, notification, and the change-request
+   decision. Ask the floating assistant for request status and the next dose.
+5. **3:00-3:40 — Check the caregiver view.** Log in as the caregiver and show
+   the assigned-patient activity, medication request history, and care-team
+   messages. The caregiver can request changes but cannot directly edit the
+   schedule or decide requests.
+6. **3:40-4:30 — Run a sensor scenario.** In the simulator, select a schedule,
+   choose **Start software simulation**, then run normal removal and
+   unexpected-increase scenarios. Compare threshold and anomaly flags; confirm
+   an event only when the simulator offers confirmation. Tablet removal is
+   never proof of swallowing.
+7. **4:30-5:00 — Review AI and sign out.** Show the advisory adherence
+   prediction, historical factors, and synthetic sensor evaluation. Ask the
+   assistant about missed doses, then log out and confirm the protected
+   dashboard sends the session back to login.
+
+## Final verification and limitations
+
+Run the automated application suite with `python -m pytest -q`. It covers
+role-based API journeys, medication approvals, notification delivery,
+simulator/anomaly scenarios, ML output, assistant access checks, session
+logout, navigation targets, and responsive CSS contracts. The responsive
+checks validate declared breakpoints and mobile drawer rules; they are not a
+pixel-level browser run. Physical ESP32/HX711 behavior, external SMS/email
+delivery, and live Jitsi calls require their respective hardware or network
+services and are not covered by the local synthetic demo.
+
 ## Free communication
 
 Every portal includes a Jitsi Meet call button. Calls use the public

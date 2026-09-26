@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 
@@ -230,6 +230,141 @@ def test_final_demo_smoke_covers_registration_notifications_ml_sensor_and_assist
     assert assistant.get_json()["intent"] == "features"
 
 
+def test_complete_role_workflow_and_session_lifecycle(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    doctor = app.test_client()
+    assert doctor.post(
+        "/api/register",
+        json={"name": "Blocked Doctor", "email": "blocked@example.com", "password": "password123", "role": "Doctor"},
+    ).status_code == 403
+
+    for name, email, role in (
+        ("Journey Patient", "journey-patient@example.com", "Patient"),
+        ("Journey Caregiver", "journey-caregiver@example.com", "Caregiver"),
+    ):
+        assert doctor.post(
+            "/api/register",
+            json={"name": name, "email": email, "password": "password123", "role": role},
+        ).status_code == 201
+    new_patient = app.test_client()
+    assert new_patient.post(
+        "/api/login",
+        json={"email": "journey-patient@example.com", "password": "password123"},
+    ).status_code == 200
+    new_patient_id = new_patient.get("/api/me").get_json()["user"]["id"]
+
+    assert doctor.post("/api/login", json={"email": "doctor@example.com", "password": "password123"}).status_code == 200
+    doctor_headers = {"X-CSRF-Token": csrf(doctor)}
+    assert doctor.post(
+        "/api/doctor/patients/link",
+        json={"email": "journey-patient@example.com"},
+        headers=doctor_headers,
+    ).status_code == 200
+    assert doctor.post(
+        f"/api/doctor/patients/{new_patient_id}/caregiver",
+        json={"email": "journey-caregiver@example.com"},
+        headers=doctor_headers,
+    ).status_code == 200
+
+    caregiver = app.test_client()
+    assert caregiver.post(
+        "/api/login",
+        json={"email": "journey-caregiver@example.com", "password": "password123"},
+    ).status_code == 200
+    caregiver_headers = {"X-CSRF-Token": csrf(caregiver)}
+    caregiver_dashboard = caregiver.get("/api/caregiver/dashboard").get_json()
+    assert [patient["id"] for patient in caregiver_dashboard["patients"]] == [new_patient_id]
+
+    created = doctor.post(
+        f"/api/doctor/patients/{new_patient_id}/medications",
+        json={"name": "Journey Medication", "dosage": "1 tablet", "time": "08:00", "compartment": 1},
+        headers=doctor_headers,
+    )
+    assert created.status_code == 201
+    medication_id = created.get_json()["medication"]["id"]
+    assert doctor.patch(
+        f"/api/doctor/medications/{medication_id}",
+        json={"name": "Journey Medication Updated", "dosage": "1 tablet", "time": "09:00"},
+        headers=doctor_headers,
+    ).status_code == 200
+    second = doctor.post(
+        f"/api/doctor/patients/{new_patient_id}/medications",
+        json={"name": "Evening Medication", "dosage": "1 tablet", "time": "20:00", "compartment": 2},
+        headers=doctor_headers,
+    )
+    assert second.status_code == 201
+    second_medication_id = second.get_json()["medication"]["id"]
+
+    patient_headers = {"X-CSRF-Token": csrf(new_patient)}
+    removal = new_patient.post(
+        f"/api/patients/{new_patient_id}/medication-requests",
+        json={"operation": "REMOVE", "medication_id": medication_id},
+        headers=patient_headers,
+    )
+    caregiver_removal = caregiver.post(
+        f"/api/patients/{new_patient_id}/medication-requests",
+        json={"operation": "REMOVE", "medication_id": second_medication_id},
+        headers=caregiver_headers,
+    )
+    assert removal.status_code == caregiver_removal.status_code == 201
+    pending_ids = {
+        item["id"] for item in doctor.get("/api/doctor/medication-requests").get_json()["requests"]
+    }
+    assert {removal.get_json()["request"]["id"], caregiver_removal.get_json()["request"]["id"]} <= pending_ids
+    assert doctor.patch(
+        f"/api/doctor/medication-requests/{removal.get_json()['request']['id']}",
+        json={"decision": "APPROVED"},
+        headers=doctor_headers,
+    ).status_code == 200
+    rejected = doctor.patch(
+        f"/api/doctor/medication-requests/{caregiver_removal.get_json()['request']['id']}",
+        json={"decision": "REJECTED", "reason": "Keep the current schedule for now."},
+        headers=doctor_headers,
+    )
+    assert rejected.status_code == 200
+    assert rejected.get_json()["request"]["status"] == "REJECTED"
+
+    patient_notifications = new_patient.get("/api/notifications").get_json()["notifications"]
+    assert patient_notifications
+    assert any(item["status"] == "Discontinued" for item in new_patient.get(
+        f"/api/patients/{new_patient_id}/medications"
+    ).get_json()["medications"])
+    assert caregiver.get(f"/api/patients/{patient_id}/medications").status_code == 403
+
+    assert doctor.post(
+        "/api/messages",
+        json={"patient_id": new_patient_id, "message": "Workflow test message"},
+        headers=doctor_headers,
+    ).status_code == 201
+    assert "Workflow test message" in new_patient.get(
+        f"/api/messages?patient_id={new_patient_id}"
+    ).get_json()["messages"][-1]["body"]
+    assert new_patient.post(
+        "/api/notify/alert",
+        json={"patient_id": new_patient_id, "message": "Workflow test alert"},
+        headers=patient_headers,
+    ).get_json()["delivery"] == "in_app"
+    assert any(
+        item["message"] == "Workflow test alert"
+        for item in new_patient.get("/api/notifications").get_json()["notifications"]
+    )
+    assert caregiver.post(
+        "/api/caregiver/notify",
+        json={"patient_id": new_patient_id, "message": "Caregiver test alert"},
+        headers=caregiver_headers,
+    ).status_code == 200
+    assert any(
+        item["message"] == "Caregiver test alert"
+        for item in new_patient.get("/api/notifications").get_json()["notifications"]
+    )
+
+    for client in (doctor, new_patient, caregiver):
+        assert client.get("/api/logout").status_code == 200
+        assert client.get("/api/me").status_code == 401
+        assert client.get("/dashboard").headers["Location"].endswith("/login")
+
+
 def test_all_role_dashboards_remain_available(tmp_path):
     app = make_app(tmp_path)
     doctor_id, patient_id, _ = seed(app)
@@ -275,10 +410,12 @@ def test_landing_auth_and_role_dashboard_page_journeys(tmp_path):
     assert b"<option>Doctor</option>" not in registration.data
     assert public.get("/dashboard").headers["Location"].endswith("/login")
 
-    for email, expected_page, role_nav in (
-        ("doctor@example.com", "/dashboard/doctor", b'data-role-nav="Doctor"'),
-        ("patient@example.com", "/dashboard/patient", b'data-section="medications"'),
-        ("c@example.com", "/dashboard/caregiver", b'data-role-nav="Caregiver"'),
+    for email, expected_page, role_nav, expected_sections in (
+        ("doctor@example.com", "/dashboard/doctor", b'data-role-nav="Doctor"',
+         (b'data-section="patients"', b'data-section="requests"')),
+        ("patient@example.com", "/dashboard/patient", b'data-section="medications"', ()),
+        ("c@example.com", "/dashboard/caregiver", b'data-role-nav="Caregiver"',
+         (b'data-section="assigned-patients"',)),
     ):
         client = app.test_client()
         assert client.get(expected_page).headers["Location"].endswith("/login")
@@ -297,6 +434,8 @@ def test_landing_auth_and_role_dashboard_page_journeys(tmp_path):
         assert b'id="assistantWidget"' in response.data
         assert b'id="assistantToggle"' in response.data
         assert role_nav in response.data
+        for section in expected_sections:
+            assert section in response.data
     patient_client = app.test_client()
     patient_client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
     assert patient_client.get("/dashboard/doctor").headers["Location"].endswith("/dashboard/patient")
@@ -471,6 +610,42 @@ def test_weight_event_validates_and_records(tmp_path):
     assert {"threshold_detection", "anomaly_detection"} <= response.get_json()["sensor_analysis"].keys()
 
 
+def test_software_scenario_works_off_schedule_without_relaxing_live_reminder_window(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = (utc_now() + timedelta(hours=2)).strftime("%H:%M")
+        db.session.commit()
+
+    client = app.test_client()
+    assert client.post(
+        "/api/login", json={"email": "patient@example.com", "password": "password123"}
+    ).status_code == 200
+    token = csrf(client)
+    simulated = client.post(
+        "/api/simulation/scenario",
+        json={"patient_id": patient_id, "reminder_id": 1, "scenario": "normal_removal"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert simulated.status_code == 200
+    assert simulated.get_json()["event"]["source"] == "simulation"
+    assert {"threshold_detection", "anomaly_detection"} <= simulated.get_json()["sensor_analysis"].keys()
+
+    live_event = client.post(
+        "/api/simulation/log-event",
+        json={"patient_id": patient_id, "reminder_id": 1, "w_before": 100, "w_after": 95},
+        headers={"X-CSRF-Token": token},
+    )
+    assert live_event.status_code == 409
+    acknowledgement = client.post(
+        "/api/alarm/acknowledge",
+        json={"patient_id": patient_id, "reminder_id": 1},
+        headers={"X-CSRF-Token": token},
+    )
+    assert acknowledgement.status_code == 409
+
+
 def test_all_repeatable_sensor_scenarios_share_the_device_event_processor(tmp_path):
     expected = {
         "normal_removal": ("normal_removal", True),
@@ -593,6 +768,9 @@ def test_scenarios_expire_once_and_do_not_duplicate_notifications(tmp_path):
     )
     assert response.status_code == 200
     assert response.get_json()["event"]["state"] == "MISSED"
+    notification = client.get("/api/notifications").get_json()["notifications"][0]
+    assert notification["recipient_id"] == patient_id
+    assert "missed" in notification["message"].lower()
     client.post(
         "/api/simulation/scenario",
         json={"patient_id": patient_id, "reminder_id": 1, "scenario": "no_response"},
