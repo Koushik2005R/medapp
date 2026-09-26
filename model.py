@@ -166,14 +166,17 @@ def _load_model() -> None:
 
 
 def _features_for_patient(patient_id: int) -> tuple[list[float], int, dict[str, Any]]:
-    from app import PillLog, Reminder, db, utc_now
+    from app import PillLog, ScheduledDose, db
 
     logs = db.session.scalars(
         db.select(PillLog).where(PillLog.patient_id == patient_id)
         .order_by(PillLog.timestamp.asc()).limit(100)
     ).all()
     reminders = db.session.scalars(
-        db.select(Reminder).where(Reminder.patient_id == patient_id, Reminder.status == "Active")
+        db.select(ScheduledDose).where(
+            ScheduledDose.patient_id == patient_id,
+            ScheduledDose.status == "Active",
+        )
     ).all()
     if not reminders:
         return [12.0, float(len(logs)), 0.0, 0.0, 0.0, 0.0], len(logs), {

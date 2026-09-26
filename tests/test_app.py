@@ -1,8 +1,25 @@
 import os
+from datetime import datetime, timezone
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 
-from app import Device, DoseEvent, Reminder, User, create_app, db, token_digest, utc_now
+from app import (
+    Device,
+    DoseEvent,
+    HardwareTraffic,
+    Medication,
+    PillLog,
+    Reminder,
+    SensorEvent,
+    User,
+    create_app,
+    db,
+    event_schedule,
+    local_occurrence,
+    reminder_for_input,
+    token_digest,
+    utc_now,
+)
 
 
 def make_app(tmp_path):
@@ -66,6 +83,109 @@ def test_device_must_match_patient(tmp_path):
         headers={"X-Device-Key": device_key},
     )
     assert response.status_code == 200
+
+
+def test_device_key_is_bound_to_its_patient_and_does_not_skip_browser_csrf(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, device_key = seed(app)
+    with app.app_context():
+        other = User(name="Other", email="other@example.com", role="Patient", password_hash="")
+        db.session.add(other)
+        db.session.flush()
+        other_id = other.id
+        other_reminder = Reminder(
+            patient_id=other.id, med_name="Other medicine", time=utc_now().strftime("%H:%M"),
+            dosage="1 tablet", set_by_role="Doctor",
+        )
+        db.session.add(other_reminder)
+        db.session.add(HardwareTraffic(
+            patient_id=other.id, endpoint="/api/hardware/log-event", method="POST",
+            payload='{"patient_id":%s}' % other.id, response_status=200, created_at=utc_now(),
+        ))
+        db.session.commit()
+        other_reminder_id = other_reminder.id
+    client = app.test_client()
+    headers = {"X-Device-Key": device_key}
+    assert client.get(
+        f"/api/hardware/get-schedules?patient_id={other_id}", headers=headers
+    ).status_code == 401
+    assert client.post(
+        "/api/hardware/log-event",
+        json={"patient_id": other_id, "w_before": 100, "w_after": 95},
+        headers=headers,
+    ).status_code == 401
+    assert client.post(
+        "/api/hardware/log-event",
+        json={"patient_id": patient_id, "reminder_id": other_reminder_id, "w_before": 100, "w_after": 95},
+        headers=headers,
+    ).status_code == 409
+    assert client.post(
+        "/api/messages",
+        json={"patient_id": patient_id, "message": "not a device route"},
+        headers=headers,
+    ).status_code == 400
+    assert client.get(
+        f"/api/hardware/get-schedules?patient_id={patient_id}", headers=headers
+    ).status_code == 200
+    doctor = app.test_client()
+    assert doctor.post(
+        "/api/login", json={"email": "doctor@example.com", "password": "password123"}
+    ).status_code == 200
+    traffic = doctor.get("/api/hardware/traffic").get_json()["traffic"]
+    assert traffic
+    assert all(entry["payload"].find(f'"patient_id":{other_id}') == -1 for entry in traffic)
+
+
+def test_patient_timezone_controls_dose_schedule_and_skips_dst_gap(tmp_path):
+    app = make_app(tmp_path)
+    with app.app_context():
+        patient = User(
+            name="Patient", email="p@example.com", role="Patient",
+            password_hash="", timezone="America/New_York",
+        )
+        db.session.add(patient)
+        db.session.flush()
+        reminder = Reminder(
+            patient_id=patient.id, med_name="Medicine", time="08:00",
+            dosage="1 tablet", set_by_role="Doctor", response_window_minutes=30,
+        )
+        dst_reminder = Reminder(
+            patient_id=patient.id, med_name="Night medicine", time="02:30",
+            dosage="1 tablet", set_by_role="Doctor",
+        )
+        db.session.add_all([reminder, dst_reminder])
+        db.session.flush()
+        assert event_schedule(
+            patient, reminder, datetime(2026, 1, 15, 13, 15, tzinfo=timezone.utc)
+        ) == datetime(2026, 1, 15, 13, 0, tzinfo=timezone.utc)
+        assert event_schedule(
+            patient, reminder, datetime(2026, 1, 15, 12, 59, tzinfo=timezone.utc)
+        ) is None
+        assert local_occurrence(patient, dst_reminder, datetime(2026, 3, 8).date()) is None
+
+
+def test_dose_input_matches_only_the_schedule_due_in_the_event_window(tmp_path):
+    app = make_app(tmp_path)
+    with app.app_context():
+        patient = User(
+            name="Patient", email="p@example.com", role="Patient",
+            password_hash="", timezone="UTC",
+        )
+        db.session.add(patient)
+        db.session.flush()
+        due = Reminder(
+            patient_id=patient.id, med_name="Morning medicine", time="08:00",
+            dosage="1 tablet", set_by_role="Doctor",
+        )
+        later = Reminder(
+            patient_id=patient.id, med_name="Evening medicine", time="20:00",
+            dosage="1 tablet", set_by_role="Doctor",
+        )
+        db.session.add_all([due, later])
+        db.session.flush()
+        when = datetime(2026, 1, 15, 8, 15, tzinfo=timezone.utc)
+        assert reminder_for_input(patient.id, None, None, when) == due
+        assert reminder_for_input(patient.id, later.id, None, when) is None
 
 
 def test_sensor_model_metadata_requires_authentication(tmp_path):
@@ -210,7 +330,64 @@ def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):
     assert response.status_code == 200
     assert response.get_json()["state"] == "REMOVAL_DETECTED"
     with app.app_context():
-        assert db.session.scalar(db.select(DoseEvent).where(DoseEvent.patient_id == patient_id)).state == "REMOVAL_DETECTED"
+        event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.patient_id == patient_id))
+        assert event.state == "REMOVAL_DETECTED"
+        assert db.session.scalar(db.select(SensorEvent).where(SensorEvent.dose_event_id == event.id))
+        assert db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)) is None
+    response = client.post(
+        f"/api/simulation/events/{event.id}/confirm",
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["event"]["state"] == "MANUALLY_CONFIRMED"
+    with app.app_context():
+        assert db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)).status == "Manual Override"
+
+
+def test_small_weight_change_does_not_classify_dose_as_removed(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    token = csrf(client)
+    acknowledged = client.post(
+        "/api/alarm/acknowledge",
+        json={"patient_id": patient_id, "reminder_id": 1},
+        headers={"X-CSRF-Token": token},
+    )
+    assert acknowledged.status_code == 200
+    response = client.post(
+        "/api/simulation/log-event",
+        json={"patient_id": patient_id, "reminder_id": 1, "w_before": 100, "w_after": 99},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["state"] == "AWAITING_CONFIRMATION"
+    with app.app_context():
+        assert db.session.scalar(db.select(PillLog).where(PillLog.patient_id == patient_id)) is None
+        assert db.session.scalar(db.select(SensorEvent).where(SensorEvent.patient_id == patient_id))
+
+
+def test_timezone_endpoint_rejects_invalid_zone_and_persists_valid_zone(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    token = csrf(client)
+    assert client.post(
+        "/api/patient/timezone",
+        json={"timezone": "Not/A_Timezone"},
+        headers={"X-CSRF-Token": token},
+    ).status_code == 400
+    response = client.post(
+        "/api/patient/timezone",
+        json={"timezone": "America/New_York"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 200
+    dashboard = client.get("/api/patient/dashboard").get_json()
+    assert dashboard["timezone"] == "America/New_York"
+    assert dashboard["schedules"][0]["timezone"] == "America/New_York"
 
 
 def test_scenarios_expire_once_and_do_not_duplicate_notifications(tmp_path):

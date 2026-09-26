@@ -1,9 +1,10 @@
 # Smart Pill Box Monitoring Backend
 
-This project provides the Phase 1 Flask backend for medication schedules, pill
-weight events, and session-based multi-role authentication. SQLite is used by
-default. Physical ESP32/HX711 and camera verification remain future integrations;
-the current simulator is software-only.
+This project provides a Flask application for doctor-managed medications,
+patient/caregiver medication requests, medication schedules, pill weight events,
+and session-based multi-role authentication. SQLite is used by default. Physical
+ESP32/HX711 and camera verification remain future integrations; the current
+simulator is software-only.
 
 ## Setup
 
@@ -12,13 +13,48 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
 $env:SECRET_KEY = "generate-a-long-random-value"
+flask --app app db upgrade
 flask --app app run --debug
 ```
 
 `SECRET_KEY` is required; the application will not start with a fallback secret.
 The default database is `instance/database.db` (ignored by Git). Set `DATABASE_URL`
-to use a different SQLAlchemy-supported database URL. Additive migrations run at
-startup and preserve existing records.
+to use a different SQLAlchemy-supported database URL. Apply versioned database
+migrations before starting the application. Migrations preserve existing users,
+schedules, messages, notifications, and medication logs, and backfill legacy
+schedule names into normalized medication records. Existing hardware traffic
+records remain available, with payloads restricted to known telemetry fields
+and visibility limited to the patient's assigned doctor or caregiver.
+
+## Medication management and approvals
+
+Medication records, scheduled doses, and sensor events have separate database
+models. Doctors linked to a patient can add and edit medications, discontinue
+them, or archive them. Discontinued and archived records remain visible in the
+patient's history and are never physically deleted.
+
+Patients and their assigned caregivers can view medication records and submit
+add, edit, or remove requests. The assigned doctor reviews requests and can
+approve them or reject them with a required reason. Pending duplicate requests
+are rejected. The requester can read the request status and the doctor's
+decision from the portal or these APIs:
+
+- `GET /api/patients/<patient_id>/medications`
+- `POST /api/doctor/patients/<patient_id>/medications`
+- `PATCH /api/doctor/medications/<medication_id>` (edit, discontinue, or archive)
+- `POST /api/patients/<patient_id>/medication-requests`
+- `GET /api/patients/<patient_id>/medication-requests`
+- `GET /api/doctor/medication-requests`
+- `PATCH /api/doctor/medication-requests/<request_id>` with
+  `{ "decision": "APPROVED" }` or
+  `{ "decision": "REJECTED", "reason": "..." }`
+- `GET /api/patients/<patient_id>/medication-audit`
+- `GET /api/notifications`
+
+All medication changes and decisions create append-only audit entries, and
+notifications are stored for the patient. Only the patient's linked doctor can
+approve or reject a request; caregivers can request changes but cannot modify
+records directly.
 
 ## API
 
@@ -234,7 +270,7 @@ medapp/
 Single-command startup after Python is installed:
 
 ```powershell
-python -m pip install -r requirements.txt; $env:SECRET_KEY = "replace-with-a-long-random-value"; python -m flask --app app run
+python -m pip install -r requirements.txt; $env:SECRET_KEY = "replace-with-a-long-random-value"; python -m flask --app app db upgrade; python -m flask --app app run
 ```
 
 ## Phase 7: final demonstration package

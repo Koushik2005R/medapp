@@ -18,14 +18,18 @@ import re
 import smtplib
 import urllib.request
 from statistics import median
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
 from typing import Any, Callable, TypeVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, jsonify, render_template, request, session
+from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation, predict_risk, risk_level, train_model
@@ -38,6 +42,7 @@ class Base(DeclarativeBase):
 
 
 db = SQLAlchemy(model_class=Base)
+migrate = Migrate(compare_type=True)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -57,11 +62,12 @@ class User(db.Model):
     email: Mapped[str] = mapped_column(db.String(255), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(db.String(255), nullable=False)
     role: Mapped[str] = mapped_column(db.String(20), nullable=False)
+    timezone: Mapped[str] = mapped_column(db.String(64), nullable=False, default="UTC")
     linked_doctor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     linked_caregiver_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
 
-    reminders: Mapped[list["Reminder"]] = relationship(
-        back_populates="patient", foreign_keys="Reminder.patient_id"
+    reminders: Mapped[list["ScheduledDose"]] = relationship(
+        back_populates="patient", foreign_keys="ScheduledDose.patient_id"
     )
     doctor: Mapped["User | None"] = relationship(
         remote_side="User.id", foreign_keys=[linked_doctor_id]
@@ -82,12 +88,41 @@ class User(db.Model):
             "name": self.name,
             "email": self.email,
             "role": self.role,
+            "timezone": self.timezone,
             "linked_doctor_id": self.linked_doctor_id,
             "linked_caregiver_id": self.linked_caregiver_id,
         }
 
 
-class Reminder(db.Model):
+class Medication(db.Model):
+    __tablename__ = "medications"
+    __table_args__ = (
+        CheckConstraint("status IN ('Active', 'Discontinued', 'Archived')", name="ck_medication_status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(db.String(150), nullable=False)
+    status: Mapped[str] = mapped_column(db.String(20), nullable=False, default="Active")
+    created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False, default=utc_now)
+
+    schedules: Mapped[list["ScheduledDose"]] = relationship(back_populates="medication")
+
+    def to_dict(self) -> dict[str, Any]:
+        schedule = next((item for item in self.schedules if item.status == "Active"), None)
+        return {
+            "id": self.id,
+            "patient_id": self.patient_id,
+            "name": self.name,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "schedule": schedule.to_dict() if schedule else None,
+        }
+
+
+class ScheduledDose(db.Model):
     __tablename__ = "reminders"
     __table_args__ = (
         CheckConstraint("status IN ('Active', 'Completed')", name="ck_reminder_status"),
@@ -95,6 +130,8 @@ class Reminder(db.Model):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    medication_id: Mapped[int | None] = mapped_column(ForeignKey("medications.id"), index=True)
+    # Kept for compatibility with existing SQLite rows and API clients.
     med_name: Mapped[str] = mapped_column(db.String(150), nullable=False)
     time: Mapped[str] = mapped_column(db.String(5), nullable=False)
     dosage: Mapped[str] = mapped_column(db.String(100), nullable=False)
@@ -109,12 +146,13 @@ class Reminder(db.Model):
     noise_threshold: Mapped[float] = mapped_column(db.Float, nullable=False, default=0.15)
 
     patient: Mapped[User] = relationship(back_populates="reminders", foreign_keys=[patient_id])
+    medication: Mapped[Medication | None] = relationship(back_populates="schedules")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "patient_id": self.patient_id,
-            "med_name": self.med_name,
+            "med_name": self.medication.name if self.medication else self.med_name,
             "time": self.time,
             "dosage": self.dosage,
             "set_by_role": self.set_by_role,
@@ -126,7 +164,94 @@ class Reminder(db.Model):
             "calibration_offset": self.calibration_offset,
             "response_window_minutes": self.response_window_minutes,
             "noise_threshold": self.noise_threshold,
+            "timezone": self.patient.timezone,
         }
+
+
+Reminder = ScheduledDose
+
+
+class MedicationChangeRequest(db.Model):
+    __tablename__ = "medication_change_requests"
+    __table_args__ = (
+        CheckConstraint("operation IN ('ADD', 'EDIT', 'REMOVE')", name="ck_med_request_operation"),
+        CheckConstraint("status IN ('PENDING', 'APPROVED', 'REJECTED')", name="ck_med_request_status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    medication_id: Mapped[int | None] = mapped_column(ForeignKey("medications.id"), index=True)
+    requested_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    operation: Mapped[str] = mapped_column(db.String(10), nullable=False)
+    requested_data: Mapped[dict[str, Any]] = mapped_column(db.JSON, nullable=False)
+    pending_key: Mapped[str | None] = mapped_column(db.String(220), unique=True)
+    status: Mapped[str] = mapped_column(db.String(10), nullable=False, default="PENDING")
+    decision_reason: Mapped[str | None] = mapped_column(db.String(1000))
+    decided_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False, default=utc_now)
+    decided_at: Mapped[datetime | None] = mapped_column(db.DateTime(timezone=True))
+
+    patient: Mapped[User] = relationship(foreign_keys=[patient_id])
+    medication: Mapped[Medication | None] = relationship()
+    requested_by: Mapped[User] = relationship(foreign_keys=[requested_by_id])
+    decided_by: Mapped[User | None] = relationship(foreign_keys=[decided_by_id])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "patient_id": self.patient_id,
+            "medication_id": self.medication_id,
+            "medication_name": self.medication.name if self.medication else self.requested_data.get("name"),
+            "requested_by_id": self.requested_by_id,
+            "requested_by_name": self.requested_by.name,
+            "operation": self.operation,
+            "requested_data": self.requested_data,
+            "status": self.status,
+            "decision_reason": self.decision_reason,
+            "decided_by_id": self.decided_by_id,
+            "decided_by_name": self.decided_by.name if self.decided_by else None,
+            "created_at": self.created_at.isoformat(),
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
+class MedicationAudit(db.Model):
+    __tablename__ = "medication_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    medication_id: Mapped[int | None] = mapped_column(ForeignKey("medications.id"), index=True)
+    request_id: Mapped[int | None] = mapped_column(ForeignKey("medication_change_requests.id"))
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    action: Mapped[str] = mapped_column(db.String(30), nullable=False)
+    before_data: Mapped[dict[str, Any] | None] = mapped_column(db.JSON)
+    after_data: Mapped[dict[str, Any] | None] = mapped_column(db.JSON)
+    reason: Mapped[str | None] = mapped_column(db.String(1000))
+    created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False, default=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "patient_id": self.patient_id,
+            "medication_id": self.medication_id,
+            "request_id": self.request_id,
+            "actor_id": self.actor_id,
+            "action": self.action,
+            "before_data": self.before_data,
+            "after_data": self.after_data,
+            "reason": self.reason,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+@sqlalchemy_event.listens_for(MedicationAudit, "before_update")
+def prevent_medication_audit_update(mapper, connection, target):
+    raise ValueError("Medication audit records are immutable")
+
+
+@sqlalchemy_event.listens_for(MedicationAudit, "before_delete")
+def prevent_medication_audit_delete(mapper, connection, target):
+    raise ValueError("Medication audit records cannot be deleted")
 
 
 class PillLog(db.Model):
@@ -232,14 +357,40 @@ class DoseEvent(db.Model):
         }
 
 
+class SensorEvent(db.Model):
+    __tablename__ = "sensor_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    scheduled_dose_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), nullable=False, index=True)
+    dose_event_id: Mapped[int] = mapped_column(ForeignKey("dose_events.id"), nullable=False, index=True)
+    recorded_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(db.String(30), nullable=False)
+    readings_before: Mapped[list[float]] = mapped_column(db.JSON, nullable=False)
+    readings_after: Mapped[list[float]] = mapped_column(db.JSON, nullable=False)
+    filtered_delta: Mapped[float] = mapped_column(db.Float, nullable=False)
+    analysis: Mapped[dict[str, Any]] = mapped_column(db.JSON, nullable=False)
+
+
 class Notification(db.Model):
     __tablename__ = "notifications"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     patient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    recipient_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
     message: Mapped[str] = mapped_column(db.String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "patient_id": self.patient_id,
+            "sender_id": self.sender_id,
+            "recipient_id": self.recipient_id,
+            "message": self.message,
+            "created_at": self.created_at.isoformat(),
+        }
 
 
 class Message(db.Model):
@@ -267,6 +418,7 @@ class HardwareTraffic(db.Model):
     __tablename__ = "hardware_traffic"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
     endpoint: Mapped[str] = mapped_column(db.String(120), nullable=False)
     method: Mapped[str] = mapped_column(db.String(10), nullable=False)
     payload: Mapped[str] = mapped_column(db.Text, nullable=False)
@@ -315,44 +467,15 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         app.config.update(test_config)
 
     db.init_app(app)
+    migrate.init_app(app, db, compare_type=True)
     with app.app_context():
-        db.create_all()
-        migrate_schema()
+        if app.config.get("TESTING"):
+            db.create_all()
         train_model()
 
     register_routes(app)
     register_csrf(app)
     return app
-
-
-def migrate_schema() -> None:
-    """Apply additive SQLite migrations while retaining all existing records."""
-    db.session.execute(db.text(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
-    ))
-    if db.session.scalar(db.text("SELECT COUNT(*) FROM schema_version")) == 0:
-        db.session.execute(db.text("INSERT INTO schema_version(version) VALUES (0)"))
-    for table, column, definition in (
-        ("reminders", "compartment", "INTEGER"),
-        ("reminders", "tablet_weight", "FLOAT NOT NULL DEFAULT 0.5"),
-        ("reminders", "expected_quantity", "INTEGER NOT NULL DEFAULT 1"),
-        ("reminders", "tolerance", "FLOAT NOT NULL DEFAULT 0.2"),
-        ("reminders", "calibration_offset", "FLOAT NOT NULL DEFAULT 0.0"),
-        ("reminders", "response_window_minutes", "INTEGER NOT NULL DEFAULT 30"),
-        ("reminders", "noise_threshold", "FLOAT NOT NULL DEFAULT 0.15"),
-        ("pill_logs", "reminder_id", "INTEGER"),
-        ("pill_logs", "dose_event_id", "INTEGER"),
-        ("pill_logs", "compartment", "INTEGER"),
-        ("pill_logs", "source", "VARCHAR(30)"),
-        ("pill_logs", "verification_method", "VARCHAR(50)"),
-    ):
-        columns = {
-            row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).all()
-        }
-        if column not in columns:
-            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
-    db.session.execute(db.text("UPDATE schema_version SET version = 1"))
-    db.session.commit()
 
 
 def register_csrf(app: Flask) -> None:
@@ -370,7 +493,10 @@ def register_csrf(app: Flask) -> None:
             return None
         if not request.path.startswith("/api/") or request.path in {"/api/login", "/api/register"}:
             return None
-        if request.headers.get("X-Device-Key"):
+        if request.path in {
+            "/api/hardware/get-schedules",
+            "/api/hardware/log-event",
+        } and request.headers.get("X-Device-Key"):
             return None
         expected = session.get("csrf_token")
         if not expected or not secrets.compare_digest(
@@ -400,6 +526,14 @@ def device_patient() -> User | None:
 
 def valid_weight(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)) and 0 <= float(value) <= 100000
+
+
+def valid_samples(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, list)
+        and 1 <= len(value) <= 1000
+        and all(valid_weight(reading) for reading in value)
+    )
 
 
 def login_required(view: F) -> F:
@@ -436,11 +570,17 @@ def role_required(*roles: str):
 
 
 def user_summary(user: User) -> dict[str, Any]:
-    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role}
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "timezone": user.timezone,
+    }
 
 
 def get_patient(patient_id: Any) -> User | None:
-    return db.session.get(User, patient_id) if isinstance(patient_id, int) else None
+    return db.session.get(User, patient_id) if isinstance(patient_id, int) and not isinstance(patient_id, bool) else None
 
 
 def risk_payload(patient_id: int) -> dict[str, Any]:
@@ -455,6 +595,207 @@ def can_access_patient(user: User, patient: User) -> bool:
         or user.role == "Caregiver"
         and patient.linked_caregiver_id == user.id
     )
+
+
+def medication_snapshot(medication: Medication) -> dict[str, Any]:
+    return {
+        "id": medication.id,
+        "patient_id": medication.patient_id,
+        "name": medication.name,
+        "status": medication.status,
+        "schedules": [
+            {
+                "id": schedule.id,
+                "time": schedule.time,
+                "dosage": schedule.dosage,
+                "status": schedule.status,
+                "compartment": schedule.compartment,
+                "tablet_weight": schedule.tablet_weight,
+                "expected_quantity": schedule.expected_quantity,
+                "tolerance": schedule.tolerance,
+                "calibration_offset": schedule.calibration_offset,
+                "response_window_minutes": schedule.response_window_minutes,
+                "noise_threshold": schedule.noise_threshold,
+            }
+            for schedule in sorted(medication.schedules, key=lambda item: item.id)
+        ],
+    }
+
+
+def add_medication_audit(
+    patient_id: int,
+    actor_id: int,
+    action: str,
+    medication: Medication | None,
+    before_data: dict[str, Any] | None,
+    reason: str | None = None,
+    request_id: int | None = None,
+) -> None:
+    db.session.add(MedicationAudit(
+        patient_id=patient_id,
+        medication_id=medication.id if medication else None,
+        request_id=request_id,
+        actor_id=actor_id,
+        action=action,
+        before_data=before_data,
+        after_data=medication_snapshot(medication) if medication else None,
+        reason=reason,
+        created_at=utc_now(),
+    ))
+
+
+def normalize_medication_data(
+    raw: Any, operation: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(raw, dict):
+        return None, "medication data must be an object"
+    allowed = {
+        "name", "dosage", "time", "compartment", "tablet_weight",
+        "expected_quantity", "tolerance", "calibration_offset",
+        "response_window_minutes", "noise_threshold",
+    }
+    if set(raw) - allowed:
+        return None, "medication data contains unsupported fields"
+    if operation == "ADD" and not {"name", "dosage", "time"} <= set(raw):
+        return None, "name, dosage, and time are required for a new medication"
+    if operation == "EDIT" and not raw:
+        return None, "at least one medication field is required"
+    data = dict(raw)
+    for field in ("name", "dosage", "time"):
+        if field not in data:
+            continue
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            return None, f"{field} must be a non-empty string"
+        value = value.strip()
+        maximum = 150 if field == "name" else 100 if field == "dosage" else 5
+        if len(value) > maximum or field == "time" and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            return None, f"{field} is invalid"
+        data[field] = value
+    if "compartment" in data:
+        try:
+            if isinstance(data["compartment"], bool):
+                raise ValueError
+            if isinstance(data["compartment"], float) and not data["compartment"].is_integer():
+                raise ValueError
+            data["compartment"] = int(data["compartment"]) if data["compartment"] not in (None, "") else None
+        except (TypeError, ValueError):
+            return None, "compartment must be an integer from 1 to 8"
+        if data["compartment"] is not None and not 1 <= data["compartment"] <= 8:
+            return None, "compartment must be an integer from 1 to 8"
+    for field, default in (
+        ("tablet_weight", 0.5),
+        ("tolerance", 0.2),
+        ("calibration_offset", 0.0),
+        ("noise_threshold", 0.15),
+    ):
+        if field not in data:
+            if operation == "ADD":
+                data[field] = default
+            continue
+        try:
+            data[field] = float(data[field])
+        except (TypeError, ValueError):
+            return None, f"{field} must be a finite number"
+        if not math.isfinite(data[field]):
+            return None, f"{field} must be a finite number"
+        if field != "calibration_offset" and data[field] <= 0:
+            return None, f"{field} must be greater than zero"
+    for field, default in (("expected_quantity", 1), ("response_window_minutes", 30)):
+        if field not in data:
+            if operation == "ADD":
+                data[field] = default
+            continue
+        try:
+            number = int(data[field])
+        except (TypeError, ValueError):
+            return None, f"{field} is invalid"
+        if isinstance(data[field], bool) or str(number) != str(data[field]).strip() and not isinstance(data[field], int):
+            return None, f"{field} is invalid"
+        maximum = 100 if field == "expected_quantity" else 1440
+        if not 1 <= number <= maximum:
+            return None, f"{field} is outside the allowed range"
+        data[field] = number
+    return data, None
+
+
+def apply_medication_data(
+    patient: User,
+    data: dict[str, Any],
+    actor_id: int,
+    set_by_role: str,
+    medication: Medication | None = None,
+) -> Medication:
+    name = data.get("name", medication.name if medication else None)
+    is_new = medication is None
+    if medication is None:
+        medication = Medication(
+            patient_id=patient.id,
+            name=name,
+            status="Active",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.session.add(medication)
+        db.session.flush()
+    elif "name" in data:
+        medication.name = name
+        medication.updated_at = utc_now()
+        for schedule in medication.schedules:
+            schedule.med_name = name
+
+    schedules = [item for item in medication.schedules if item.status == "Active"]
+    schedule = schedules[0] if schedules else None
+    if schedule is None and (is_new or "time" in data or "dosage" in data):
+        schedule = Reminder(
+            patient_id=patient.id,
+            medication_id=medication.id,
+            medication=medication,
+            med_name=medication.name,
+            time=data.get("time", "08:00"),
+            dosage=data.get("dosage", ""),
+            set_by_role=set_by_role,
+        )
+        db.session.add(schedule)
+    elif schedule is not None:
+        schedule.med_name = medication.name
+        schedule.set_by_role = set_by_role
+    if schedule is not None:
+        for field in (
+            "time", "dosage", "compartment", "tablet_weight", "expected_quantity",
+            "tolerance", "calibration_offset", "response_window_minutes", "noise_threshold",
+        ):
+            if field in data:
+                setattr(schedule, field, data[field])
+    medication.status = "Active"
+    medication.updated_at = utc_now()
+    return medication
+
+
+def notify_medication_change(
+    patient: User, sender: User, message: str, recipient: User | None = None
+) -> None:
+    db.session.add(Notification(
+        patient_id=patient.id,
+        sender_id=sender.id,
+        recipient_id=(recipient or patient).id,
+        message=message,
+        created_at=utc_now(),
+    ))
+
+
+def medication_records(patient_id: int) -> list[dict[str, Any]]:
+    medications = db.session.scalars(db.select(Medication).where(
+        Medication.patient_id == patient_id
+    ).order_by(Medication.name, Medication.id)).all()
+    return [item.to_dict() for item in medications]
+
+
+def medication_requests_for(patient_id: int) -> list[dict[str, Any]]:
+    requests_for_patient = db.session.scalars(db.select(MedicationChangeRequest).where(
+        MedicationChangeRequest.patient_id == patient_id
+    ).order_by(MedicationChangeRequest.created_at.desc())).all()
+    return [item.to_dict() for item in requests_for_patient]
 
 
 def dispatch_alert(patient: User, message: str) -> str:
@@ -501,45 +842,135 @@ def dispatch_alert(patient: User, message: str) -> str:
 
 
 def record_hardware_traffic(endpoint: str, method: str, payload: Any, response_status: int) -> None:
+    safe_payload = {
+        key: payload[key]
+        for key in ("patient_id", "reminder_id", "compartment")
+        if isinstance(payload, dict) and key in payload
+    }
     db.session.add(
         HardwareTraffic(
+            patient_id=safe_payload.get("patient_id"),
             endpoint=endpoint,
             method=method,
-            payload=json.dumps(payload, separators=(",", ":")),
+            payload=json.dumps(safe_payload, separators=(",", ":")),
             response_status=response_status,
             created_at=utc_now(),
         )
     )
 
 
-def event_schedule(reminder: Reminder, when: datetime) -> datetime:
+def patient_timezone(patient: User) -> ZoneInfo:
+    return ZoneInfo(patient.timezone)
+
+
+def local_occurrence(patient: User, reminder: Reminder, local_date: date) -> datetime | None:
     hour, minute = (int(part) for part in reminder.time.split(":"))
-    return when.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    local_time = datetime.combine(local_date, time(hour, minute)).replace(
+        tzinfo=patient_timezone(patient)
+    )
+    # A local time in the spring DST gap has no corresponding instant.
+    if local_time.astimezone(timezone.utc).astimezone(local_time.tzinfo).replace(tzinfo=None) != local_time.replace(tzinfo=None):
+        return None
+    return local_time.astimezone(timezone.utc)
+
+
+def event_schedule(
+    patient: User, reminder: Reminder, when: datetime
+) -> datetime | None:
+    now = as_utc(when).astimezone(patient_timezone(patient))
+    candidates = [
+        occurrence
+        for local_date in (now.date() - timedelta(days=1), now.date(), now.date() + timedelta(days=1))
+        if (occurrence := local_occurrence(patient, reminder, local_date)) is not None
+        and occurrence <= as_utc(when)
+        and as_utc(when) <= occurrence + timedelta(minutes=reminder.response_window_minutes)
+    ]
+    return max(candidates) if candidates else None
 
 
 def event_key(patient_id: int, reminder_id: int, scheduled_at: datetime) -> str:
-    return f"{scheduled_at.date().isoformat()}:{patient_id}:{reminder_id}"
+    return f"{scheduled_at.isoformat()}:{patient_id}:{reminder_id}"
+
+
+def event_for_occurrence(
+    patient: User, reminder: Reminder, scheduled_at: datetime, source: str
+) -> tuple[DoseEvent, bool]:
+    key = event_key(patient.id, reminder.id, scheduled_at)
+    event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.event_key == key))
+    if event is None:
+        event = db.session.scalar(db.select(DoseEvent).where(
+            DoseEvent.patient_id == patient.id,
+            DoseEvent.reminder_id == reminder.id,
+            DoseEvent.scheduled_at == scheduled_at,
+        ))
+    if event is not None:
+        return event, False
+    event = DoseEvent(
+        event_key=key,
+        patient_id=patient.id,
+        reminder_id=reminder.id,
+        compartment=reminder.compartment,
+        scheduled_at=scheduled_at,
+        due_at=scheduled_at,
+        state="REMINDER_DUE",
+        source=source,
+    )
+    db.session.add(event)
+    db.session.flush()
+    return event, True
+
+
+def refresh_due_events(patient: User, now: datetime) -> bool:
+    now = as_utc(now)
+    local_today = now.astimezone(patient_timezone(patient)).date()
+    changed = False
+    reminders = db.session.scalars(db.select(Reminder).where(
+        Reminder.patient_id == patient.id,
+        Reminder.status == "Active",
+    )).all()
+    for reminder in reminders:
+        for local_date in (local_today - timedelta(days=1), local_today):
+            scheduled_at = local_occurrence(patient, reminder, local_date)
+            if scheduled_at is None or scheduled_at > now:
+                continue
+            event, created = event_for_occurrence(patient, reminder, scheduled_at, "schedule")
+            changed = created or changed
+            if event.state == "REMINDER_DUE":
+                event.state = "ALERTING"
+                changed = True
+            changed = expire_event(event, now) or changed
+    return changed
+
+
+def next_scheduled_dose(patient: User, now: datetime) -> dict[str, Any] | None:
+    now = as_utc(now)
+    local_today = now.astimezone(patient_timezone(patient)).date()
+    reminders = db.session.scalars(db.select(Reminder).where(
+        Reminder.patient_id == patient.id,
+        Reminder.status == "Active",
+    )).all()
+    upcoming = [
+        (scheduled_at, reminder)
+        for reminder in reminders
+        for local_date in (local_today, local_today + timedelta(days=1), local_today + timedelta(days=2))
+        if (scheduled_at := local_occurrence(patient, reminder, local_date)) is not None
+        and scheduled_at > now
+    ]
+    if not upcoming:
+        return None
+    scheduled_at, reminder = min(upcoming, key=lambda item: item[0])
+    return {"scheduled_at": scheduled_at.isoformat(), "reminder": reminder.to_dict()}
 
 
 def get_or_create_dose_event(
     patient: User, reminder: Reminder, when: datetime, source: str
-) -> DoseEvent:
-    scheduled_at = event_schedule(reminder, when)
-    key = event_key(patient.id, reminder.id, scheduled_at)
-    event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.event_key == key))
-    if event is None:
-        event = DoseEvent(
-            event_key=key,
-            patient_id=patient.id,
-            reminder_id=reminder.id,
-            compartment=reminder.compartment,
-            scheduled_at=scheduled_at,
-            due_at=scheduled_at,
-            state="IDLE" if scheduled_at > when else "REMINDER_DUE",
-            source=source,
-        )
-        db.session.add(event)
-        db.session.flush()
+) -> DoseEvent | None:
+    scheduled_at = event_schedule(patient, reminder, when)
+    if scheduled_at is None:
+        return None
+    event, _ = event_for_occurrence(patient, reminder, scheduled_at, source)
+    if event.state == "REMINDER_DUE" and as_utc(when) >= scheduled_at:
+        event.state = "ALERTING"
     return event
 
 
@@ -601,23 +1032,34 @@ def complete_dose_event(
     return pill_log, None
 
 
-def reminder_for_input(patient_id: int, reminder_id: Any, compartment: Any) -> Reminder | None:
-    if isinstance(reminder_id, int):
-        reminder = db.session.get(Reminder, reminder_id)
-        return reminder if reminder and reminder.patient_id == patient_id else None
-    if isinstance(compartment, int):
-        return db.session.scalar(
-            db.select(Reminder).where(
-                Reminder.patient_id == patient_id,
-                Reminder.compartment == compartment,
-                Reminder.status == "Active",
-            ).order_by(Reminder.id.desc())
-        )
-    return db.session.scalar(
-        db.select(Reminder).where(
-            Reminder.patient_id == patient_id, Reminder.status == "Active"
-        ).order_by(Reminder.id.desc())
+def reminder_for_input(
+    patient_id: int,
+    reminder_id: Any,
+    compartment: Any,
+    when: datetime | None = None,
+) -> Reminder | None:
+    now = when or utc_now()
+    statement = db.select(Reminder).where(
+        Reminder.patient_id == patient_id,
+        Reminder.status == "Active",
     )
+    if isinstance(reminder_id, int) and not isinstance(reminder_id, bool):
+        statement = statement.where(Reminder.id == reminder_id)
+    elif isinstance(compartment, int) and not isinstance(compartment, bool):
+        statement = statement.where(Reminder.compartment == compartment)
+    elif reminder_id is not None or compartment is not None:
+        return None
+    reminders = db.session.scalars(statement.order_by(Reminder.time, Reminder.id)).all()
+    if isinstance(reminder_id, int) or isinstance(compartment, int):
+        if len(reminders) != 1:
+            return None
+        reminder = reminders[0]
+        return reminder if event_schedule(reminder.patient, reminder, now) is not None else None
+    due = [
+        reminder for reminder in reminders
+        if event_schedule(reminder.patient, reminder, now) is not None
+    ]
+    return due[0] if len(due) == 1 else None
 
 
 def process_sensor_reading(
@@ -632,24 +1074,24 @@ def process_sensor_reading(
 ) -> tuple[DoseEvent, PillLog | None, dict[str, Any]]:
     now = when or utc_now()
     event = get_or_create_dose_event(patient, reminder, now, source)
+    if event is None:
+        raise ValueError("no scheduled dose is due within its response window")
     if event.state in {"MISSED", "MANUALLY_CONFIRMED"} or event.completed_at:
         return event, db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)), {}
-    if event.state in {"AWAITING_CONFIRMATION", "REMOVAL_DETECTED"} and event.filtered_delta is not None:
-        return event, None, {}
     if expire_event(event, now):
         return event, None, {}
     def clean_samples(values: list[float] | None, fallback: float) -> list[float]:
-        if not values:
+        if values is None:
             return [fallback]
-        cleaned = [
-            float(value) for value in values
-            if valid_weight(value)
-        ]
-        return cleaned or [fallback]
+        if not values or len(values) > 1000 or not all(valid_weight(value) for value in values):
+            raise ValueError("sensor sample arrays must contain 1 to 1000 valid readings")
+        return [float(value) for value in values]
 
-    before_value = median(clean_samples(samples_before, before)) + reminder.calibration_offset
-    after_value = median(clean_samples(samples_after, after)) + reminder.calibration_offset
-    readings = clean_samples(samples_before, before) + clean_samples(samples_after, after)
+    before_readings = clean_samples(samples_before, before)
+    after_readings = clean_samples(samples_after, after)
+    before_value = median(before_readings) + reminder.calibration_offset
+    after_value = median(after_readings) + reminder.calibration_offset
+    readings = before_readings + after_readings
     sensor_analysis = analyze_readings(
         readings,
         reminder.tablet_weight * reminder.expected_quantity,
@@ -664,11 +1106,20 @@ def process_sensor_reading(
     event.detected_at = now
     event.source = source
     expected = reminder.tablet_weight * reminder.expected_quantity
-    if delta > reminder.noise_threshold:
-        event.state = "REMOVAL_DETECTED"
     if abs(delta - expected) <= reminder.tolerance:
         event.state = "REMOVAL_DETECTED"
         event.verification_method = "calibrated_weight_delta"
+    db.session.add(SensorEvent(
+        patient_id=patient.id,
+        scheduled_dose_id=reminder.id,
+        dose_event_id=event.id,
+        recorded_at=now,
+        source=source,
+        readings_before=before_readings,
+        readings_after=after_readings,
+        filtered_delta=delta,
+        analysis=sensor_analysis,
+    ))
     return event, None, sensor_analysis
 
 
@@ -779,6 +1230,8 @@ def register_routes(app: Flask) -> None:
             return json_error("weights must be finite numbers from 0 to 100000", 400)
         if float(w_after) > float(w_before):
             return json_error("w_after cannot exceed w_before", 400)
+        if not all(valid_samples(data.get(key)) for key in ("samples_before", "samples_after")):
+            return json_error("sensor sample arrays must contain 1 to 1000 valid readings", 400)
         if db.session.get(User, patient_id) is None or device_patient_user.role != "Patient":
             return json_error("patient not found", 404)
         reminder = reminder_for_input(patient_id, data.get("reminder_id"), data.get("compartment"))
@@ -814,6 +1267,8 @@ def register_routes(app: Flask) -> None:
             return json_error("weights must be finite numbers from 0 to 100000", 400)
         if float(w_after) > float(w_before):
             return json_error("w_after cannot exceed w_before", 400)
+        if not all(valid_samples(data.get(key)) for key in ("samples_before", "samples_after")):
+            return json_error("sensor sample arrays must contain 1 to 1000 valid readings", 400)
         reminder = reminder_for_input(patient.id, data.get("reminder_id"), data.get("compartment"))
         if reminder is None:
             return json_error("an active medication schedule is required", 409)
@@ -854,24 +1309,32 @@ def register_routes(app: Flask) -> None:
             db.select(DoseEvent).where(DoseEvent.patient_id == patient.id)
             .order_by(DoseEvent.scheduled_at.desc()).limit(30)
         ).all()
-        changed = False
-        for event in events:
-            if event.state == "IDLE" and now >= as_utc(event.scheduled_at):
-                event.state = "REMINDER_DUE"
-                changed = True
-            if event.state == "REMINDER_DUE" and now >= as_utc(event.scheduled_at):
-                event.state = "ALERTING"
-                changed = True
-            changed = expire_event(event, now) or changed
+        changed = refresh_due_events(patient, now)
         if changed:
             db.session.commit()
+            events = db.session.scalars(
+                db.select(DoseEvent).where(DoseEvent.patient_id == patient.id)
+                .order_by(DoseEvent.scheduled_at.desc()).limit(30)
+            ).all()
         return jsonify({"events": [event.to_dict() for event in events]})
 
     @app.get("/api/hardware/traffic")
     @role_required("Doctor", "Caregiver")
     def hardware_traffic():
+        actor = current_user()
+        if actor.role == "Doctor":
+            patients = db.session.scalars(
+                db.select(User.id).where(User.linked_doctor_id == actor.id)
+            ).all()
+        else:
+            patients = db.session.scalars(
+                db.select(User.id).where(User.linked_caregiver_id == actor.id)
+            ).all()
+        if not patients:
+            return jsonify({"traffic": []})
         entries = db.session.scalars(
             db.select(HardwareTraffic)
+            .where(HardwareTraffic.patient_id.in_(patients))
             .order_by(HardwareTraffic.created_at.desc())
             .limit(50)
         ).all()
@@ -952,6 +1415,8 @@ def register_routes(app: Flask) -> None:
                         if patient.caregiver
                         else None,
                         "risk": risk_payload(patient.id),
+                        "medications": medication_records(patient.id),
+                        "medication_requests": medication_requests_for(patient.id),
                         "reminders": [
                             reminder.to_dict()
                             for reminder in patient.reminders
@@ -1059,8 +1524,319 @@ def register_routes(app: Flask) -> None:
             "device_key": token,
         }), 201
 
+    @app.get("/api/patients/<int:patient_id>/medications")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def patient_medications(patient_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient's medications", 403)
+        medications = db.session.scalars(
+            db.select(Medication)
+            .where(Medication.patient_id == patient.id)
+            .order_by(Medication.name, Medication.id)
+        ).all()
+        return jsonify({"medications": [item.to_dict() for item in medications]})
+
+    @app.post("/api/patients/<int:patient_id>/medication-requests")
+    @role_required("Patient", "Caregiver")
+    def submit_medication_request(patient_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient's medications", 403)
+        if patient.linked_doctor_id is None:
+            return json_error("A linked doctor is required to review medication changes", 409)
+        doctor = db.session.get(User, patient.linked_doctor_id)
+        if doctor is None or doctor.role != "Doctor":
+            return json_error("The patient's assigned doctor is unavailable", 409)
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return json_error("request body must be an object", 400)
+        operation = data.get("operation")
+        if operation not in {"ADD", "EDIT", "REMOVE"}:
+            return json_error("operation must be ADD, EDIT, or REMOVE", 400)
+        medication_id = data.get("medication_id")
+        medication = None
+        if operation == "ADD":
+            if medication_id is not None:
+                return json_error("ADD requests cannot target an existing medication", 400)
+            requested_data, error = normalize_medication_data(data.get("requested_data"), operation)
+            if error is None and db.session.scalar(db.select(Medication.id).where(
+                Medication.patient_id == patient.id,
+                db.func.lower(Medication.name) == requested_data["name"].lower(),
+                Medication.status == "Active",
+            )):
+                return json_error("an active medication with this name already exists", 409)
+        else:
+            if not isinstance(medication_id, int) or isinstance(medication_id, bool):
+                return json_error("medication_id is required", 400)
+            medication = db.session.get(Medication, medication_id)
+            if medication is None or medication.patient_id != patient.id or medication.status != "Active":
+                return json_error("active medication not found for this patient", 404)
+            requested_data, error = normalize_medication_data(
+                {} if operation == "REMOVE" and data.get("requested_data") is None
+                else data.get("requested_data", {}),
+                operation if operation == "EDIT" else "REMOVE",
+            )
+        if error:
+            return json_error(error, 400)
+        if operation == "REMOVE" and requested_data:
+            return json_error("REMOVE requests cannot include medication changes", 400)
+        if operation == "ADD":
+            fingerprint = hashlib.sha256(
+                json.dumps(requested_data, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            pending_key = f"{patient.id}:ADD:{fingerprint}"
+        else:
+            pending_key = f"{patient.id}:{operation}:{medication.id}"
+        if db.session.scalar(db.select(MedicationChangeRequest.id).where(
+            MedicationChangeRequest.pending_key == pending_key
+        )):
+            return json_error("an identical medication change is already awaiting review", 409)
+        change_request = MedicationChangeRequest(
+            patient_id=patient.id,
+            medication_id=medication.id if medication else None,
+            requested_by_id=actor.id,
+            operation=operation,
+            requested_data=requested_data,
+            pending_key=pending_key,
+            status="PENDING",
+            created_at=utc_now(),
+        )
+        db.session.add(change_request)
+        try:
+            db.session.flush()
+        except IntegrityError:
+            db.session.rollback()
+            return json_error("an identical medication change is already awaiting review", 409)
+        notify_medication_change(
+            patient,
+            actor,
+            f"{actor.name} requested to {operation.lower()} medication "
+            f"{medication.name if medication else requested_data['name']}.",
+            doctor,
+        )
+        db.session.commit()
+        return jsonify({"status": "success", "request": change_request.to_dict()}), 201
+
+    @app.get("/api/patients/<int:patient_id>/medication-requests")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def patient_medication_requests(patient_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient's medication requests", 403)
+        requests_for_patient = db.session.scalars(
+            db.select(MedicationChangeRequest)
+            .where(MedicationChangeRequest.patient_id == patient.id)
+            .order_by(MedicationChangeRequest.created_at.desc())
+        ).all()
+        return jsonify({"requests": [item.to_dict() for item in requests_for_patient]})
+
+    @app.get("/api/patients/<int:patient_id>/medication-audit")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def patient_medication_audit(patient_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or not can_access_patient(actor, patient):
+            return json_error("You do not have access to this patient's medication history", 403)
+        entries = db.session.scalars(
+            db.select(MedicationAudit)
+            .where(MedicationAudit.patient_id == patient.id)
+            .order_by(MedicationAudit.created_at.desc(), MedicationAudit.id.desc())
+            .limit(200)
+        ).all()
+        return jsonify({"audit": [entry.to_dict() for entry in entries]})
+
+    @app.get("/api/notifications")
+    @role_required("Doctor", "Patient", "Caregiver")
+    def user_notifications():
+        actor = current_user()
+        notifications = db.session.scalars(
+            db.select(Notification)
+            .where(Notification.recipient_id == actor.id)
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .limit(100)
+        ).all()
+        return jsonify({"notifications": [item.to_dict() for item in notifications]})
+
+    @app.get("/api/doctor/medication-requests")
+    @role_required("Doctor")
+    def doctor_medication_requests():
+        doctor = current_user()
+        patient_id = request.args.get("patient_id", type=int)
+        statement = (
+            db.select(MedicationChangeRequest)
+            .join(User, MedicationChangeRequest.patient_id == User.id)
+            .where(User.linked_doctor_id == doctor.id)
+        )
+        if patient_id is not None:
+            statement = statement.where(MedicationChangeRequest.patient_id == patient_id)
+        requests_for_doctor = db.session.scalars(
+            statement.order_by(
+                MedicationChangeRequest.status,
+                MedicationChangeRequest.created_at.desc(),
+            )
+        ).all()
+        return jsonify({"requests": [item.to_dict() for item in requests_for_doctor]})
+
+    @app.patch("/api/doctor/medication-requests/<int:request_id>")
+    @role_required("Doctor")
+    def decide_medication_request(request_id: int):
+        doctor = current_user()
+        change_request = db.session.get(MedicationChangeRequest, request_id)
+        patient = get_patient(change_request.patient_id) if change_request else None
+        if (
+            change_request is None
+            or patient is None
+            or patient.linked_doctor_id != doctor.id
+        ):
+            return json_error("medication request not found for an assigned patient", 404)
+        if change_request.status != "PENDING":
+            return json_error("medication request has already been decided", 409)
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return json_error("request body must be an object", 400)
+        decision = data.get("decision")
+        reason = data.get("reason", "")
+        if decision not in {"APPROVED", "REJECTED"}:
+            return json_error("decision must be APPROVED or REJECTED", 400)
+        if not isinstance(reason, str) or len(reason.strip()) > 1000:
+            return json_error("reason must be 1000 characters or fewer", 400)
+        reason = reason.strip()
+        if decision == "REJECTED" and not reason:
+            return json_error("a reason is required when rejecting a request", 400)
+
+        medication = db.session.get(Medication, change_request.medication_id) if change_request.medication_id else None
+        before_data = medication_snapshot(medication) if medication else None
+        if decision == "APPROVED":
+            if change_request.operation == "ADD":
+                normalized, error = normalize_medication_data(change_request.requested_data, "ADD")
+                if error:
+                    return json_error(f"request can no longer be applied: {error}", 409)
+                existing = db.session.scalar(db.select(Medication).where(
+                    Medication.patient_id == patient.id,
+                    db.func.lower(Medication.name) == normalized["name"].lower(),
+                    Medication.status == "Active",
+                ))
+                if existing:
+                    return json_error("an active medication with this name already exists", 409)
+                medication = apply_medication_data(patient, normalized, doctor.id, doctor.role)
+            elif medication is None or medication.patient_id != patient.id or medication.status != "Active":
+                return json_error("requested medication is no longer active", 409)
+            elif change_request.operation == "EDIT":
+                normalized, error = normalize_medication_data(change_request.requested_data, "EDIT")
+                if error:
+                    return json_error(f"request can no longer be applied: {error}", 409)
+                apply_medication_data(patient, normalized, doctor.id, doctor.role, medication)
+            else:
+                medication.status = "Discontinued"
+                medication.updated_at = utc_now()
+                for schedule in medication.schedules:
+                    if schedule.status == "Active":
+                        schedule.status = "Completed"
+            add_medication_audit(
+                patient.id, doctor.id, f"{change_request.operation}_APPROVED",
+                medication, before_data, reason or None, change_request.id,
+            )
+            notify_medication_change(
+                patient, doctor,
+                f"Your request to {change_request.operation.lower()} "
+                f"{medication.name if medication else 'a medication'} was approved."
+                + (f" Doctor's note: {reason}" if reason else ""),
+            )
+        else:
+            add_medication_audit(
+                patient.id, doctor.id, "REQUEST_REJECTED", medication,
+                before_data, reason, change_request.id,
+            )
+            notify_medication_change(
+                patient, doctor,
+                f"Your request to {change_request.operation.lower()} "
+                f"{medication.name if medication else change_request.requested_data.get('name', 'a medication')} "
+                f"was rejected. Reason: {reason}",
+            )
+        change_request.status = decision
+        change_request.decision_reason = reason or None
+        change_request.decided_by_id = doctor.id
+        change_request.decided_at = utc_now()
+        change_request.pending_key = None
+        db.session.commit()
+        return jsonify({"status": "success", "request": change_request.to_dict()})
+
+    @app.post("/api/doctor/patients/<int:patient_id>/medications")
+    @role_required("Doctor")
+    def doctor_add_medication(patient_id: int):
+        doctor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None or patient.linked_doctor_id != doctor.id:
+            return json_error("assigned patient not found", 404)
+        values, error = normalize_medication_data(request.get_json(silent=True), "ADD")
+        if error:
+            return json_error(error, 400)
+        duplicate = db.session.scalar(db.select(Medication.id).where(
+            Medication.patient_id == patient.id,
+            db.func.lower(Medication.name) == values["name"].lower(),
+            Medication.status == "Active",
+        ))
+        if duplicate:
+            return json_error("an active medication with this name already exists", 409)
+        medication = apply_medication_data(patient, values, doctor.id, doctor.role)
+        add_medication_audit(patient.id, doctor.id, "CREATED", medication, None)
+        notify_medication_change(patient, doctor, f"Your doctor added medication {medication.name}.")
+        db.session.commit()
+        return jsonify({"status": "success", "medication": medication.to_dict()}), 201
+
+    @app.patch("/api/doctor/medications/<int:medication_id>")
+    @role_required("Doctor")
+    def doctor_update_medication(medication_id: int):
+        doctor = current_user()
+        medication = db.session.get(Medication, medication_id)
+        patient = get_patient(medication.patient_id) if medication else None
+        if medication is None or patient is None or patient.linked_doctor_id != doctor.id:
+            return json_error("medication not found for an assigned patient", 404)
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return json_error("request body must be an object", 400)
+        status = data.get("status")
+        changes = {key: value for key, value in data.items() if key != "status"}
+        if medication.status != "Active" and not (
+            medication.status == "Discontinued" and status == "Archived" and not changes
+        ):
+            return json_error("only active medications can be changed", 409)
+        if status is not None and status not in {"Discontinued", "Archived"}:
+            return json_error("status must be Discontinued or Archived", 400)
+        normalized, error = normalize_medication_data(changes, "EDIT") if changes else ({}, None)
+        if error:
+            return json_error(error, 400)
+        if status is None and not changes:
+            return json_error("a medication change is required", 400)
+        before_data = medication_snapshot(medication)
+        if normalized:
+            if "name" in normalized and db.session.scalar(db.select(Medication.id).where(
+                Medication.patient_id == patient.id,
+                Medication.id != medication.id,
+                db.func.lower(Medication.name) == normalized["name"].lower(),
+                Medication.status == "Active",
+            )):
+                return json_error("an active medication with this name already exists", 409)
+            apply_medication_data(patient, normalized, doctor.id, doctor.role, medication)
+        if status:
+            medication.status = status
+            medication.updated_at = utc_now()
+            for schedule in medication.schedules:
+                if schedule.status == "Active":
+                    schedule.status = "Completed"
+        add_medication_audit(patient.id, doctor.id, status or "UPDATED", medication, before_data)
+        notify_medication_change(
+            patient, doctor, f"Your medication record {medication.name} was {status.lower() if status else 'updated'} by your doctor."
+        )
+        db.session.commit()
+        return jsonify({"status": "success", "medication": medication.to_dict()})
+
     @app.post("/api/doctor/patients/<int:patient_id>/schedules")
-    @role_required("Doctor", "Caregiver")
+    @role_required("Doctor")
     def create_schedule(patient_id: int):
         actor = current_user()
         patient = get_patient(patient_id)
@@ -1073,80 +1849,61 @@ def register_routes(app: Flask) -> None:
         calibration_offset = data.get("calibration_offset", 0.0)
         response_window_minutes = data.get("response_window_minutes", 30)
         noise_threshold = data.get("noise_threshold", 0.15)
-        if isinstance(compartment, str) and compartment.strip():
-            try:
-                compartment = int(compartment)
-            except ValueError:
-                compartment = None
-        for field in ("expected_quantity", "response_window_minutes"):
-            value = locals()[field]
-            if isinstance(value, str) and value.strip():
-                try:
-                    if field == "expected_quantity":
-                        expected_quantity = int(value)
-                    else:
-                        response_window_minutes = int(value)
-                except ValueError:
-                    pass
-        for field in ("tablet_weight", "tolerance", "calibration_offset", "noise_threshold"):
-            value = locals()[field]
-            if isinstance(value, str) and value.strip():
-                try:
-                    converted = float(value)
-                    if field == "tablet_weight":
-                        tablet_weight = converted
-                    elif field == "tolerance":
-                        tolerance = converted
-                    elif field == "calibration_offset":
-                        calibration_offset = converted
-                    else:
-                        noise_threshold = converted
-                except ValueError:
-                    pass
         can_edit = patient and (
-            (actor.role == "Doctor" and patient.linked_doctor_id == actor.id)
-            or (actor.role == "Caregiver" and patient.linked_caregiver_id == actor.id)
+            actor.role == "Doctor" and patient.linked_doctor_id == actor.id
         )
         if not can_edit:
-            return json_error("patient is not assigned to you", 403)
-        if not all(isinstance(value, str) and value.strip() for value in (med_name, reminder_time, dosage)):
-            return json_error("med_name, time, and dosage are required", 400)
-        if len(med_name.strip()) > 150 or len(dosage.strip()) > 100 or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", reminder_time.strip()):
-            return json_error("med_name, dosage, or time is invalid", 400)
-        if compartment is not None and (
-            not isinstance(compartment, int) or isinstance(compartment, bool) or not 1 <= compartment <= 8
-        ):
-            return json_error("compartment must be an integer from 1 to 8", 400)
-        if (
-            not valid_weight(tablet_weight) or float(tablet_weight) <= 0
-            or not isinstance(expected_quantity, int) or isinstance(expected_quantity, bool)
-            or not 1 <= expected_quantity <= 100
-            or not valid_weight(tolerance) or float(tolerance) <= 0
-            or not isinstance(response_window_minutes, int)
-            or isinstance(response_window_minutes, bool)
-            or not 1 <= response_window_minutes <= 1440
-            or not valid_weight(noise_threshold)
-            or float(noise_threshold) <= 0
-            or not isinstance(calibration_offset, (int, float))
-            or isinstance(calibration_offset, bool)
-            or not math.isfinite(float(calibration_offset))
-        ):
-            return json_error("invalid sensor configuration", 400)
+            return json_error("only the assigned doctor can add medication directly", 403)
+        values, error = normalize_medication_data({
+            "name": med_name,
+            "time": reminder_time,
+            "dosage": dosage,
+            "compartment": compartment,
+            "tablet_weight": tablet_weight,
+            "expected_quantity": expected_quantity,
+            "tolerance": tolerance,
+            "calibration_offset": calibration_offset,
+            "response_window_minutes": response_window_minutes,
+            "noise_threshold": noise_threshold,
+        }, "ADD")
+        if error:
+            return json_error(error, 400)
+        medication = db.session.scalar(db.select(Medication).where(
+            Medication.patient_id == patient.id,
+            db.func.lower(Medication.name) == values["name"].lower(),
+        ))
+        if medication is not None and medication.status != "Active":
+            return json_error("a medication with this name is already retained in history", 409)
+        before_data = medication_snapshot(medication) if medication else None
+        if medication is None:
+            medication = Medication(
+                patient_id=patient.id,
+                name=values["name"],
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            db.session.add(medication)
+            db.session.flush()
         reminder = Reminder(
             patient_id=patient.id,
-            med_name=med_name.strip(),
-            time=reminder_time.strip(),
-            dosage=dosage.strip(),
+            medication_id=medication.id,
+            medication=medication,
+            med_name=values["name"],
+            time=values["time"],
+            dosage=values["dosage"],
             set_by_role=actor.role,
-            compartment=compartment,
-            tablet_weight=float(tablet_weight),
-            expected_quantity=expected_quantity,
-            tolerance=float(tolerance),
-            calibration_offset=float(calibration_offset),
-            response_window_minutes=response_window_minutes,
-            noise_threshold=float(noise_threshold),
+            compartment=values["compartment"],
+            tablet_weight=values["tablet_weight"],
+            expected_quantity=values["expected_quantity"],
+            tolerance=values["tolerance"],
+            calibration_offset=values["calibration_offset"],
+            response_window_minutes=values["response_window_minutes"],
+            noise_threshold=values["noise_threshold"],
         )
         db.session.add(reminder)
+        medication.updated_at = utc_now()
+        add_medication_audit(patient.id, actor.id, "SCHEDULE_ADDED", medication, before_data)
+        notify_medication_change(patient, actor, f"Your doctor added a schedule for {medication.name}.")
         db.session.commit()
         return jsonify({"status": "success", "schedule": reminder.to_dict()}), 201
 
@@ -1154,6 +1911,8 @@ def register_routes(app: Flask) -> None:
     @role_required("Patient")
     def patient_dashboard():
         patient = current_user()
+        if refresh_due_events(patient, utc_now()):
+            db.session.commit()
         logs = db.session.scalars(
             db.select(PillLog).where(PillLog.patient_id == patient.id).order_by(PillLog.timestamp.desc()).limit(10)
         ).all()
@@ -1162,10 +1921,30 @@ def register_routes(app: Flask) -> None:
                 "doctor": user_summary(patient.doctor) if patient.doctor else None,
                 "caregiver": user_summary(patient.caregiver) if patient.caregiver else None,
                 "risk": risk_payload(patient.id),
+                "medications": medication_records(patient.id),
+                "medication_requests": medication_requests_for(patient.id),
                 "schedules": [r.to_dict() for r in patient.reminders if r.status == "Active"],
+                "next_dose": next_scheduled_dose(patient, utc_now()),
+                "timezone": patient.timezone,
                 "logs": [log.to_dict() for log in logs],
             }
         )
+
+    @app.post("/api/patient/timezone")
+    @role_required("Patient")
+    def update_patient_timezone():
+        patient = current_user()
+        data = request.get_json(silent=True) or {}
+        zone_name = data.get("timezone")
+        if not isinstance(zone_name, str) or not zone_name.strip() or len(zone_name.strip()) > 64:
+            return json_error("timezone must be a valid IANA timezone", 400)
+        try:
+            ZoneInfo(zone_name.strip())
+        except ZoneInfoNotFoundError:
+            return json_error("timezone must be a valid IANA timezone", 400)
+        patient.timezone = zone_name.strip()
+        db.session.commit()
+        return jsonify({"status": "success", "timezone": patient.timezone})
 
     @app.get("/api/caregiver/dashboard")
     @role_required("Caregiver")
@@ -1174,6 +1953,8 @@ def register_routes(app: Flask) -> None:
         patients = db.session.scalars(
             db.select(User).where(User.linked_caregiver_id == caregiver.id).order_by(User.name)
         ).all()
+        for patient in patients:
+            refresh_due_events(patient, utc_now())
         patient_ids = [patient.id for patient in patients]
         logs = db.session.scalars(
             db.select(PillLog)
@@ -1187,6 +1968,8 @@ def register_routes(app: Flask) -> None:
                     {
                         **user_summary(patient),
                         "risk": risk_payload(patient.id),
+                        "medications": medication_records(patient.id),
+                        "medication_requests": medication_requests_for(patient.id),
                         "reminders": [
                             reminder.to_dict()
                             for reminder in patient.reminders
@@ -1260,6 +2043,8 @@ def register_routes(app: Flask) -> None:
             return json_error("You do not have access to this patient", 403)
         now = utc_now()
         event = get_or_create_dose_event(patient, reminder, now, "simulation")
+        if event is None:
+            return json_error("the medication reminder is not due", 409)
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
             return json_error("this scheduled dose is already closed", 409)
         if event.state == "IDLE":
@@ -1311,6 +2096,8 @@ def register_routes(app: Flask) -> None:
             return json_error("unknown simulation scenario", 400)
         now = utc_now()
         event = get_or_create_dose_event(patient, reminder, now, "simulation")
+        if event is None:
+            return json_error("the medication reminder is not due", 409)
         sensor_analysis = {}
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
             return jsonify({"status": "success", "scenario": scenario, "event": event.to_dict()})

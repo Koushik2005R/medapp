@@ -19,8 +19,10 @@ function showOnly(id) { ['doctorView','patientView','caregiverView'].forEach((it
 function empty(message) { return `<div class="text-secondary text-center py-4">${esc(message)}</div>`; }
 function pillBox(schedules, logs = []) {
   return `<div class="card border-0 shadow-sm p-4 mb-4"><h2 class="h5 mb-3">Interactive Pill Box</h2><div class="pill-box">${schedules.slice(0, 8).map((item, index) => {
-    const taken = logs.some((log) => log.status === 'Taken' && log.timestamp.slice(0, 10) === new Date().toISOString().slice(0, 10));
-    return `<div class="pill-compartment ${taken ? 'taken' : ''}" data-compartment="${item.compartment || index + 1}"><div class="pill-icon ${taken ? 'removed' : ''}" data-pill="${item.compartment || index + 1}">${taken ? '' : '💊'}</div><div class="small fw-semibold">Compartment ${item.compartment || index + 1}</div><div class="small text-secondary">${esc(item.time)} · ${taken ? 'Empty / Taken' : esc(item.med_name)}</div></div>`;
+    const today = localDateKey(new Date(), item.timezone || 'UTC');
+    const taken = logs.some((log) => log.reminder_id === item.id && ['Taken', 'Manual Override'].includes(log.status) && localDateKey(new Date(log.timestamp), item.timezone || 'UTC') === today);
+    const compartment = item.compartment ?? index + 1;
+    return `<div class="pill-compartment ${taken ? 'taken' : ''}" data-compartment="${compartment}"><div class="pill-icon ${taken ? 'removed' : ''}" data-pill="${compartment}">${taken ? '' : '💊'}</div><div class="small fw-semibold">Compartment ${compartment}</div><div class="small text-secondary">${esc(item.time)} · ${taken ? 'Empty / Taken' : esc(item.med_name)}</div></div>`;
   }).join('') || empty('No active compartments scheduled.')}</div></div>`;
 }
 function startBuzzer() {
@@ -55,25 +57,35 @@ function triggerAlarm(patientId, reminder, patientName = state.user.name) {
   bootstrap.Modal.getOrCreateInstance($('#alarmModal')).show();
   if ('Notification' in window && Notification.permission === 'granted') new Notification('PillGuard medication reminder', {body: 'MEDICATION TIME! Please access your Pill Box now.'});
 }
-function scheduleKey(patientId, reminder) {
-  const now = new Date();
-  return `${now.toISOString().slice(0, 10)}:${patientId}:${reminder.id}:${reminder.time}`;
+function localDateKey(now, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+function scheduleKey(patientId, reminder, timezone, now) {
+  return `${localDateKey(now, timezone)}:${patientId}:${reminder.id}:${reminder.time}`;
 }
 function checkAlarms() {
-  const now = new Date(); const current = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-  state.schedules.forEach(({patientId, reminder, patientName}) => { const key = scheduleKey(patientId, reminder); if (reminder.time === current && !state.alarmKeys.has(key)) { state.alarmKeys.add(key); triggerAlarm(patientId, reminder, patientName); } });
+  const now = new Date();
+  state.schedules.forEach(({patientId, reminder, patientName, timezone}) => {
+    const parts = new Intl.DateTimeFormat('en-GB', {timeZone: timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}).formatToParts(now);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const current = `${values.hour}:${values.minute}`;
+    const key = scheduleKey(patientId, reminder, timezone, now);
+    if (reminder.time === current && !state.alarmKeys.has(key)) { state.alarmKeys.add(key); triggerAlarm(patientId, reminder, patientName); }
+  });
 }
 function configureAlarms(schedules) {
-  state.schedules = schedules.flatMap((item) => (item.reminders || item.schedules || []).map((reminder) => ({patientId: item.id, reminder, patientName: item.name || state.user.name})));
+  state.schedules = schedules.flatMap((item) => (item.reminders || item.schedules || []).map((reminder) => ({patientId: item.id, reminder, patientName: item.name || state.user.name, timezone: item.timezone || reminder.timezone || 'UTC'})));
   if (!state.alarmTimer) state.alarmTimer = setInterval(checkAlarms, 1000);
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
 }
-function startNextDoseCountdown(schedules) {
-  if (!$('#nextDoseCountdown') || !schedules.length) return;
+function startNextDoseCountdown(nextDose) {
+  if (!$('#nextDoseCountdown')) return;
+  if (!nextDose) { $('#nextDoseCountdown').textContent = '--:--:--'; return; }
+  const dueAt = new Date(nextDose.scheduled_at).getTime();
   const update = () => {
-    const now = new Date(); const [hour, minute] = schedules[0].time.split(':').map(Number);
-    const next = new Date(now); next.setHours(hour, minute, 0, 0); if (next <= now) next.setDate(next.getDate() + 1);
-    const seconds = Math.floor((next - now) / 1000);
+    const seconds = Math.max(0, Math.floor((dueAt - Date.now()) / 1000));
     $('#nextDoseCountdown').textContent = `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds % 3600 / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
   };
   update(); if (state.countdownTimer) clearInterval(state.countdownTimer); state.countdownTimer = setInterval(update, 1000);
@@ -206,13 +218,115 @@ function bindCommunication(patients, selectedId = '') {
   };
 }
 
+function medicationRecordsPanel(patientId, medications, requests, allowRequests) {
+  const records = medications.length ? medications.map((medication) => {
+    const schedule = medication.schedule || {};
+    return `<article class="border rounded-3 p-3 mb-2"><div class="d-flex justify-content-between align-items-start"><div><strong>${esc(medication.name)}</strong> <span class="badge text-bg-${medication.status === 'Active' ? 'success' : medication.status === 'Discontinued' ? 'warning' : 'secondary'}">${esc(medication.status)}</span><div class="small text-secondary">${schedule.time ? `${esc(schedule.time)} · ${esc(schedule.dosage)}` : 'No active schedule'}</div></div></div></article>`;
+  }).join('') : empty('No medication records yet.');
+  const requestHistory = requests.length ? requests.map((item) => `<div class="border-top py-2"><div><span class="badge text-bg-${item.status === 'PENDING' ? 'warning' : item.status === 'APPROVED' ? 'success' : 'danger'}">${esc(item.status)}</span> ${esc(item.operation)} · ${esc(item.medication_name || item.requested_data.name || 'Medication')}</div><div class="small text-secondary">${new Date(item.created_at).toLocaleString()}${item.decision_reason ? ` · Doctor: ${esc(item.decision_reason)}` : ''}</div></div>`).join('') : empty('No medication change requests.');
+  const form = allowRequests ? `<form data-medication-request="${patientId}" class="border rounded-3 p-3 mt-3"><h4 class="h6">Request a medication change</h4><select name="operation" class="form-select mb-2" required><option value="ADD">Add medication</option><option value="EDIT">Edit medication</option><option value="REMOVE">Remove medication</option></select><select name="medication_id" class="form-select mb-2"><option value="">Choose existing medication</option>${medications.filter((item) => item.status === 'Active').map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join('')}</select><input name="name" class="form-control mb-2" maxlength="150" placeholder="Medication name (add or rename)"><div class="row g-2 mb-2"><div class="col"><input name="dosage" class="form-control" maxlength="100" placeholder="Dosage"></div><div class="col"><input name="time" type="time" class="form-control"></div></div><button class="btn btn-sm btn-primary">Submit for doctor approval</button></form>` : '';
+  return `<section class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Medication records</h2><div>${records}</div>${form}<div class="mt-3"><h3 class="h6">Change request history</h3>${requestHistory}</div><div data-medication-audit="${patientId}" class="mt-3"></div></section>`;
+}
+
+function doctorMedicationPanel(patients) {
+  return `<section class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Medication management</h2>${patients.length ? patients.map((patient) => `<div class="border-top pt-3 mt-3"><h3 class="h6">${esc(patient.name)}</h3>${(patient.medications || []).length ? patient.medications.map((medication) => {
+    const schedule = medication.schedule || {};
+    const statusClass = medication.status === 'Active' ? 'success' : medication.status === 'Discontinued' ? 'warning' : 'secondary';
+    const controls = medication.status === 'Active'
+      ? `<form data-doctor-medication="${medication.id}" class="row g-2 mt-1"><input name="name" class="form-control" value="${esc(medication.name)}" required><div class="col"><input name="dosage" class="form-control" value="${esc(schedule.dosage || '')}" placeholder="Dosage"></div><div class="col"><input name="time" type="time" class="form-control" value="${esc(schedule.time || '')}"></div><div class="col-12 d-flex gap-2"><button class="btn btn-sm btn-outline-primary">Save edits</button><button type="button" data-medication-status="Discontinued" data-medication-id="${medication.id}" class="btn btn-sm btn-outline-warning">Discontinue</button><button type="button" data-medication-status="Archived" data-medication-id="${medication.id}" class="btn btn-sm btn-outline-secondary">Archive</button></div></form>`
+      : medication.status === 'Discontinued'
+        ? `<button data-medication-status="Archived" data-medication-id="${medication.id}" class="btn btn-sm btn-outline-secondary mt-2">Archive</button>`
+        : '';
+    return `<div class="border rounded-3 p-3 mb-2"><div class="d-flex justify-content-between"><strong>${esc(medication.name)}</strong><span class="badge text-bg-${statusClass}">${esc(medication.status)}</span></div>${controls}</div>`;
+  }).join('') : empty('No medication records.')}<h4 class="h6 mt-3">Requests</h4>${(patient.medication_requests || []).map((item) => `<div class="border-top py-2"><span class="badge text-bg-${item.status === 'PENDING' ? 'warning' : item.status === 'APPROVED' ? 'success' : 'danger'}">${esc(item.status)}</span> ${esc(item.operation)} · ${esc(item.medication_name || item.requested_data.name || 'Medication')} <span class="small text-secondary">requested by ${esc(item.requested_by_name)}</span>${item.status === 'PENDING' ? `<div class="d-flex gap-2 mt-2"><button data-medication-decision="APPROVED" data-request-id="${item.id}" class="btn btn-sm btn-success">Approve</button><button data-medication-decision="REJECTED" data-request-id="${item.id}" class="btn btn-sm btn-outline-danger">Reject</button></div>` : `<div class="small text-secondary">${item.decision_reason ? `Decision: ${esc(item.decision_reason)}` : ''}</div>`}</div>`).join('') || empty('No requests.')}</div>`).join('') : empty('Link a patient to manage medications.')}</section>`;
+}
+
+async function bindMedicationPanels(patientId) {
+  const auditElement = $(`[data-medication-audit="${patientId}"]`);
+  if (auditElement) {
+    try {
+      const history = await api(`/api/patients/${patientId}/medication-audit`);
+      auditElement.innerHTML = `<h3 class="h6">Immutable medication audit</h3>${history.audit.length ? history.audit.map((item) => `<div class="small border-top py-1">${esc(item.action)} · ${new Date(item.created_at).toLocaleString()} · ${esc(item.reason || '')}</div>`).join('') : empty('No changes recorded.')}`;
+    } catch (error) { auditElement.innerHTML = `<div class="small text-danger">${esc(error.message)}</div>`; }
+  }
+  const form = $(`[data-medication-request="${patientId}"]`);
+  if (!form) return;
+  const operation = form.elements.operation;
+  const target = form.elements.medication_id;
+  const setInputs = () => {
+    const add = operation.value === 'ADD';
+    form.elements.name.required = add;
+    form.elements.dosage.required = add;
+    form.elements.time.required = add;
+    target.required = operation.value !== 'ADD';
+    form.elements.name.placeholder = operation.value === 'EDIT' ? 'Optional new medication name' : 'Medication name';
+  };
+  operation.onchange = setInputs;
+  setInputs();
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const values = formData(form);
+    const requested_data = {};
+    for (const field of ['name', 'dosage', 'time']) if (values[field].trim()) requested_data[field] = values[field].trim();
+    const body = {operation: values.operation, requested_data};
+    if (values.operation !== 'ADD') body.medication_id = Number(values.medication_id);
+    try {
+      await api(`/api/patients/${patientId}/medication-requests`, {method:'POST', body: JSON.stringify(body)});
+      notify('Medication change sent to the doctor for approval.');
+      await loadDashboard();
+    } catch (error) { notify(error.message, 'danger'); }
+  };
+}
+
+function bindDoctorMedicationPanel() {
+  document.querySelectorAll('[data-doctor-medication]').forEach((form) => {
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      try {
+        const values = formData(form);
+        await api(`/api/doctor/medications/${form.dataset.doctorMedication}`, {
+          method:'PATCH',
+          body: JSON.stringify(Object.fromEntries(Object.entries(values).filter(([, value]) => value.trim()))),
+        });
+        notify('Medication updated.');
+        await loadDoctor();
+      } catch (error) { notify(error.message, 'danger'); }
+    };
+  });
+  document.querySelectorAll('[data-medication-status]').forEach((button) => {
+    button.onclick = async () => {
+      try {
+        await api(`/api/doctor/medications/${button.dataset.medicationId}`, {
+          method:'PATCH', body: JSON.stringify({status: button.dataset.medicationStatus}),
+        });
+        notify(`Medication ${button.dataset.medicationStatus.toLowerCase()}.`);
+        await loadDoctor();
+      } catch (error) { notify(error.message, 'danger'); }
+    };
+  });
+  document.querySelectorAll('[data-medication-decision]').forEach((button) => {
+    button.onclick = async () => {
+      const decision = button.dataset.medicationDecision;
+      const reason = decision === 'REJECTED' ? window.prompt('Reason for rejecting this medication request:') : '';
+      if (decision === 'REJECTED' && !reason?.trim()) return;
+      try {
+        await api(`/api/doctor/medication-requests/${button.dataset.requestId}`, {
+          method:'PATCH', body: JSON.stringify({decision, reason: reason || ''}),
+        });
+        notify(`Medication request ${decision.toLowerCase()}.`);
+        await loadDoctor();
+      } catch (error) { notify(error.message, 'danger'); }
+    };
+  });
+}
+
 async function loadDoctor() {
   const data = await api('/api/doctor/patients'); showOnly('doctorView');
   const patients = data.patients;
   $('#doctorView').innerHTML = `<div class="row g-4">
     <div class="col-lg-4"><div class="card border-0 shadow-sm p-4"><h2 class="h5">Add a patient</h2><p class="small text-secondary">Link an existing patient by email.</p><form id="linkPatientForm" class="d-flex gap-2"><input name="email" type="email" class="form-control" placeholder="patient@email.com" required><button class="btn btn-primary">Add</button></form><div class="border-top mt-4 pt-3"><div class="small fw-semibold mb-2">Patient directory</div><form id="directoryForm" class="d-flex gap-2"><input name="search" class="form-control form-control-sm" placeholder="Search name or email"><button class="btn btn-sm btn-outline-primary">Search</button></form><div id="directoryResults" class="small mt-2"></div></div></div>
       <div class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">New medication schedule</h2><form id="scheduleForm"><select name="patient_id" class="form-select mb-2" required><option value="">Choose patient</option>${patients.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select><input name="med_name" class="form-control mb-2" placeholder="Medication name" required><div class="row g-2 mb-2"><div class="col"><input name="time" type="time" class="form-control" required></div><div class="col"><input name="compartment" type="number" min="1" max="8" class="form-control" placeholder="Compartment"></div></div><input name="dosage" class="form-control mb-2" placeholder="Dosage" required><div class="row g-2 mb-2"><div class="col"><label class="form-label small">Tablet g</label><input name="tablet_weight" type="number" min=".01" step=".01" value=".5" class="form-control"></div><div class="col"><label class="form-label small">Quantity</label><input name="expected_quantity" type="number" min="1" max="100" value="1" class="form-control"></div><div class="col"><label class="form-label small">Tolerance g</label><input name="tolerance" type="number" min=".01" step=".01" value=".2" class="form-control"></div></div><div class="row g-2 mb-3"><div class="col"><label class="form-label small">Response min</label><input name="response_window_minutes" type="number" min="1" max="1440" value="30" class="form-control"></div><div class="col"><label class="form-label small">Calibration g</label><input name="calibration_offset" type="number" step=".01" value="0" class="form-control"></div><div class="col"><label class="form-label small">Noise g</label><input name="noise_threshold" type="number" min=".01" step=".01" value=".15" class="form-control"></div></div><button class="btn btn-primary w-100">Sync schedule</button></form></div></div>
-    <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${patients[0] ? aiLabPanel(patients[0].id, patients[0].risk, patients[0].logs) : empty('Link a patient to open the AI Lab.')}${assistantPanel(patients, patients[0]?.id)}${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
+    <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${doctorMedicationPanel(patients)}${patients[0] ? aiLabPanel(patients[0].id, patients[0].risk, patients[0].logs) : empty('Link a patient to open the AI Lab.')}${assistantPanel(patients, patients[0]?.id)}${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
   $('#linkPatientForm').onsubmit = async (event) => { event.preventDefault(); try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify(formData(event.target))}); notify('Patient linked'); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#scheduleForm').onsubmit = async (event) => { event.preventDefault(); const values = formData(event.target); try { await api(`/api/doctor/patients/${values.patient_id}/schedules`, {method:'POST', body: JSON.stringify(values)}); notify('Schedule synced to patient'); event.target.reset(); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#directoryForm').onsubmit = async (event) => { event.preventDefault(); try { const results = await api(`/api/doctor/directory?search=${encodeURIComponent(formData(event.target).search)}`); $('#directoryResults').innerHTML = results.patients.length ? results.patients.map((p) => `<div class="d-flex justify-content-between align-items-center border-bottom py-2"><span>${esc(p.name)}<br><span class="text-secondary">${esc(p.email)}</span></span>${p.linked_to_doctor ? '<span class="badge text-bg-success">Linked</span>' : `<button data-directory-link="${p.email}" class="btn btn-sm btn-outline-primary">Link</button>`}</div>`).join('') : empty('No patients found.'); document.querySelectorAll('[data-directory-link]').forEach((button) => { button.onclick = async () => { try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify({email: button.dataset.directoryLink})}); notify('Patient linked'); await loadDoctor(); } catch (error) { notify(error.message, 'danger'); } }; }); } catch (error) { notify(error.message, 'danger'); } };
@@ -220,6 +334,7 @@ async function loadDoctor() {
   $('#caregiverLinkForm').onsubmit = async (event) => { event.preventDefault(); const values = formData(event.target); try { await api(`/api/doctor/patients/${values.patient_id}/caregiver`, {method:'POST', body: JSON.stringify({email: values.email})}); bootstrap.Modal.getOrCreateInstance($('#caregiverLinkModal')).hide(); event.target.reset(); notify('Caregiver linked'); await loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   bindCommunication(patients, patients[0]?.id);
   bindSimulation(patients);
+  bindDoctorMedicationPanel();
   if (patients[0]) bindAiLab();
   bindAssistant(patients, patients[0]?.id);
   configureAlarms(patients);
@@ -252,12 +367,21 @@ async function loadPatient() {
     stopBuzzer();
   }
   const doctor = data.doctor;
-  const team = [doctor, data.caregiver].filter(Boolean);
-  $('#patientView').innerHTML = `<div class="provider-banner p-4 mb-4"><p class="small opacity-75 mb-1">PATIENT OVERVIEW <span class="badge text-bg-light ms-2">Connected account</span></p><h2 class="h4 mb-1">${doctor ? `Dr. ${esc(doctor.name)}` : 'No doctor assigned yet'}</h2><div class="small">${doctor ? esc(doctor.email) : 'Connect with your care team to begin.'}${data.caregiver ? ` · Caregiver: ${esc(data.caregiver.name)} (${esc(data.caregiver.email)})` : ''}</div></div><div id="patientConfirmation"></div>${pillBox(data.schedules, data.logs)}<div class="row g-4"><div class="col-lg-7"><div class="card border-0 shadow-sm p-4"><h2 class="h5 mb-3">Medication schedule</h2><div class="row g-3">${data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.')}</div></div></div><div class="col-lg-5"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Next dose</h2><span class="status-dot mt-2"></span></div><div id="nextDoseCountdown" class="metric mt-3">${data.schedules[0] ? esc(data.schedules[0].time) : '--:--'}</div><p class="text-secondary mb-0">${data.schedules[0] ? `${esc(data.schedules[0].med_name)} · ${esc(data.schedules[0].dosage)}` : 'Nothing scheduled'}</p></div></div></div>${aiLabPanel(state.user.id, data.risk || {level:'INSUFFICIENT_DATA', historical_factors:[], validation_limitations:'No prediction available.'}, data.logs)}${assistantPanel([{id: state.user.id, name: 'My records'}], state.user.id)}${communicationPanel([{id: state.user.id, name: 'My care team'}], state.user.id)}${simulationPanel([{id: state.user.id, name: 'My account'}], false)}`;
+  const nextReminder = data.next_dose?.reminder;
+  $('#patientView').innerHTML = `<div class="provider-banner p-4 mb-4"><p class="small opacity-75 mb-1">PATIENT OVERVIEW <span class="badge text-bg-light ms-2">Connected account</span></p><h2 class="h4 mb-1">${doctor ? `Dr. ${esc(doctor.name)}` : 'No doctor assigned yet'}</h2><div class="small">${doctor ? esc(doctor.email) : 'Connect with your care team to begin.'}${data.caregiver ? ` · Caregiver: ${esc(data.caregiver.name)} (${esc(data.caregiver.email)})` : ''}</div></div><div id="patientConfirmation"></div>${pillBox(data.schedules, data.logs)}${medicationRecordsPanel(state.user.id, data.medications || [], data.medication_requests || [], true)}<div class="row g-4"><div class="col-lg-7"><div class="card border-0 shadow-sm p-4"><h2 class="h5 mb-3">Medication schedule</h2><div class="row g-3">${data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.')}</div></div></div><div class="col-lg-5"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Next dose</h2><span class="status-dot mt-2"></span></div><div id="nextDoseCountdown" class="metric mt-3">${nextReminder ? esc(nextReminder.time) : '--:--'}</div><p class="text-secondary mb-1">${nextReminder ? `${esc(nextReminder.med_name)} · ${esc(nextReminder.dosage)}` : 'Nothing scheduled'}</p><div class="small text-secondary">Patient time zone: ${esc(data.timezone)} <button id="syncTimezoneBtn" class="btn btn-sm btn-link p-0 ms-1">Use this device's time zone</button></div></div></div></div>${aiLabPanel(state.user.id, data.risk || {level:'INSUFFICIENT_DATA', historical_factors:[], validation_limitations:'No prediction available.'}, data.logs)}${assistantPanel([{id: state.user.id, name: 'My records'}], state.user.id)}${communicationPanel([{id: state.user.id, name: 'My care team'}], state.user.id)}${simulationPanel([{id: state.user.id, name: 'My account'}], false)}`;
   bindCommunication([{id: state.user.id, name: 'My care team'}], state.user.id);
+  bindMedicationPanels(state.user.id);
   bindSimulation([{id: state.user.id, name: 'My account'}]);
-  configureAlarms([{id: state.user.id, reminders: data.schedules}]);
-  startNextDoseCountdown(data.schedules);
+  configureAlarms([{id: state.user.id, timezone: data.timezone, reminders: data.schedules}]);
+  startNextDoseCountdown(data.next_dose);
+  $('#syncTimezoneBtn').onclick = async () => {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      await api('/api/patient/timezone', {method:'POST', body: JSON.stringify({timezone: zone})});
+      notify(`Time zone updated to ${zone}`);
+      await loadPatient();
+    } catch (error) { notify(error.message, 'danger'); }
+  };
   bindAiLab();
   bindAssistant([{id: state.user.id, name: 'My records'}], state.user.id);
 }
@@ -266,10 +390,11 @@ function scheduleCard(item) { return `<div class="col-md-6"><div class="border r
 async function loadCaregiver() {
   const data = await api('/api/caregiver/dashboard'); showOnly('caregiverView');
   const selectedPatient = data.patients[0];
-  $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div><div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : ''}${assistantPanel(data.patients, data.patients[0]?.id)}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;
+  $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div>${data.patients.map((patient) => medicationRecordsPanel(patient.id, patient.medications || [], patient.medication_requests || [], true)).join('')}<div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : ''}${assistantPanel(data.patients, data.patients[0]?.id)}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;
   document.querySelectorAll('[data-override]').forEach((button) => button.onclick = async () => { const reason = window.prompt('Why are you confirming this dose?'); if (!reason) return; try { await api(`/api/caregiver/logs/${button.dataset.override}/override`, {method:'POST', body: JSON.stringify({reason})}); stopBuzzer(); notify('Medication marked as taken'); loadCaregiver(); } catch (error) { notify(error.message, 'danger'); } });
   $('#notifyBtn').onclick = () => dispatchNotification(data.patients);
   bindCommunication(data.patients, data.patients[0]?.id);
+  data.patients.forEach((patient) => bindMedicationPanels(patient.id));
   bindSimulation(data.patients);
   configureAlarms(data.patients);
   if (selectedPatient) bindAiLab();
@@ -294,7 +419,7 @@ $('#signupForm').onsubmit = async (event) => {
     notify('Account created. Sign in to continue.');
   } catch (error) { notify(error.message, 'danger'); }
 };
-$('#logoutBtn').onclick = async () => { await api('/api/logout'); clearInterval(state.timer); clearInterval(state.alarmTimer); clearInterval(state.countdownTimer); stopBuzzer(); state.user = null; state.csrfToken = ''; $('#dashboardView').classList.add('d-none'); $('#authView').classList.remove('d-none'); $('#logoutBtn').classList.add('d-none'); $('#userLabel').textContent = ''; };
+$('#logoutBtn').onclick = async () => { await api('/api/logout'); clearInterval(state.timer); clearInterval(state.alarmTimer); clearInterval(state.countdownTimer); stopBuzzer(); state.user = null; state.csrfToken = ''; state.schedules = []; state.alarmKeys.clear(); $('#dashboardView').classList.add('d-none'); $('#authView').classList.remove('d-none'); $('#logoutBtn').classList.add('d-none'); $('#userLabel').textContent = ''; };
 $('#themeToggle').onclick = () => { const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = next; localStorage.setItem('pillguard-theme', next); $('#themeToggle').textContent = next === 'dark' ? '☀' : '☾'; };
 $('#themeToggle').textContent = theme === 'dark' ? '☀' : '☾';
 $('#aboutBtn').onclick = () => bootstrap.Modal.getOrCreateInstance($('#aboutModal')).show();
