@@ -33,7 +33,12 @@ from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation
-from sensor_analysis import analyze_readings, demo_sensor_analyses, evaluate_sensor_model
+from sensor_analysis import (
+    analyze_readings,
+    demo_sensor_analyses,
+    evaluate_sensor_model,
+    generate_sensor_noise,
+)
 from assistant import answer_question
 
 
@@ -1263,8 +1268,6 @@ def register_routes(app: Flask) -> None:
             return json_error("valid device authentication is required", 401)
         if not all(valid_weight(value) for value in (w_before, w_after)):
             return json_error("weights must be finite numbers from 0 to 100000", 400)
-        if float(w_after) > float(w_before):
-            return json_error("w_after cannot exceed w_before", 400)
         if not all(valid_samples(data.get(key)) for key in ("samples_before", "samples_after")):
             return json_error("sensor sample arrays must contain 1 to 1000 valid readings", 400)
         if db.session.get(User, patient_id) is None or device_patient_user.role != "Patient":
@@ -1300,8 +1303,6 @@ def register_routes(app: Flask) -> None:
             return json_error("You do not have access to this patient", 403)
         if not all(valid_weight(value) for value in (w_before, w_after)):
             return json_error("weights must be finite numbers from 0 to 100000", 400)
-        if float(w_after) > float(w_before):
-            return json_error("w_after cannot exceed w_before", 400)
         if not all(valid_samples(data.get(key)) for key in ("samples_before", "samples_after")):
             return json_error("sensor sample arrays must contain 1 to 1000 valid readings", 400)
         reminder = reminder_for_input(patient.id, data.get("reminder_id"), data.get("compartment"))
@@ -1411,6 +1412,7 @@ def register_routes(app: Flask) -> None:
         return jsonify({
             "data_source": "synthetic demo scenarios",
             "validation_limitations": "Synthetic signals are not representative of calibrated physical hardware.",
+            "evaluation": evaluate_sensor_model(),
             "scenarios": demo_sensor_analyses(),
         })
 
@@ -2128,7 +2130,10 @@ def register_routes(app: Flask) -> None:
         scenario = data.get("scenario")
         if patient is None or reminder is None or not can_access_patient(actor, patient):
             return json_error("authorized patient and active schedule are required", 400)
-        if scenario not in {"normal_removal", "delayed_removal", "no_response", "noise", "unexpected_weight"}:
+        if not isinstance(scenario, str) or scenario not in {
+            "normal_removal", "delayed_removal", "no_response", "no_removal",
+            "noise", "unexpected_weight", "unexpected_increase", "excessive_removal",
+        }:
             return json_error("unknown simulation scenario", 400)
         now = utc_now()
         event = get_or_create_dose_event(patient, reminder, now, "simulation")
@@ -2146,16 +2151,34 @@ def register_routes(app: Flask) -> None:
         else:
             before = 100.0
             after = before - expected
+            before_samples = [before, before + 0.03, before - 0.02]
+            after_samples = [after, after + 0.02, after - 0.01]
             if scenario == "delayed_removal":
                 event.due_at = now - timedelta(minutes=max(1, reminder.response_window_minutes - 1))
-            if scenario == "noise":
-                before, after = 100.0, 99.95
-            elif scenario == "unexpected_weight":
+            if scenario == "no_removal":
+                before, after = 100.0, 100.0
+                before_samples = [100.0] * 20
+                after_samples = [100.0] * 20
+            elif scenario == "noise":
+                before_samples = generate_sensor_noise(100.0, 24, noise_std=0.8, seed=91)
+                after_samples = generate_sensor_noise(100.0, 24, noise_std=0.8, seed=92)
+                before_samples = [value - median(before_samples) + 100.0 for value in before_samples]
+                after_samples = [value - median(after_samples) + 100.0 for value in after_samples]
+                before, after = 100.0, 100.0
+            elif scenario in {"unexpected_weight", "unexpected_increase"}:
                 before, after = 100.0, 100.0 - expected - (reminder.tolerance * 3)
+                if scenario == "unexpected_increase":
+                    after = 100.0 + expected
+                before_samples = [before] * 20
+                after_samples = [after] * 20
+            elif scenario == "excessive_removal":
+                before, after = 100.0, 100.0 - expected - reminder.tolerance * 3
+                before_samples = [before] * 20
+                after_samples = [after] * 20
             _, _, sensor_analysis = process_sensor_reading(
                 patient, reminder, before, after, "simulation",
-                [before, before + 0.03, before - 0.02],
-                [after, after + 0.02, after - 0.01],
+                before_samples,
+                after_samples,
                 now,
             )
         db.session.commit()

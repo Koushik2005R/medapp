@@ -218,33 +218,49 @@ metrics, confusion matrix, feature influence, and sensor-analysis comparisons.
 Synthetic sensor examples are explicitly labelled; no chart presents synthetic
 data as a patient measurement.
 
-## Phase 4: intelligent weight-sensor analysis
+## Phase 5: sensor ML and simulator
 
-`sensor_analysis.py` is the shared analysis layer for simulated and future
-physical load-cell readings. It provides a configurable Gaussian noise/drift
-generator, rolling median filtering, calibration offsets, and window features:
-weight change, variance, stability, duration, and change rate.
+`sensor_analysis.py` is shared by software simulation and authenticated
+`POST /api/hardware/log-event`. It applies the scheduled dose's configurable
+tablet weight, expected quantity, tolerance, and calibration offset, then
+applies a trailing rolling median to load-cell readings. Calibration values are
+stored on each scheduled dose and exposed through the existing hardware
+schedule endpoint. Threshold rules and the Isolation Forest independently
+classify the same filtered sample window.
 
-An Isolation Forest is trained and evaluated on deterministic synthetic
-normal, removal, unexpected-increase, excessive-removal, and unstable-signal
-scenarios. `GET /api/sensor/model` reports precision, recall, F1, data source,
-and validation limitations. The simulator response includes raw and filtered
-series, threshold classification, anomaly score, and side-by-side threshold
-versus ML results. The UI plots both raw and filtered readings.
+Train and save the model plus its evaluation report with:
 
-Threshold detection answers whether a calibrated medication-removal condition
-was met. The Isolation Forest flags unusual signal windows independently.
-An anomaly is not a confirmed removal, and a detected removal is not proof of
-consumption. Both are advisory synthetic-sensor analyses and do not override
-alarm, response-window, or manual-confirmation safety rules.
+```powershell
+python scripts/train_sensor_model.py
+```
 
-## Phase 2: medication monitoring simulator
+The versioned Isolation Forest is trained only on seeded synthetic no-removal
+and normal-removal windows (training seed 2025). Evaluation uses separate
+held-out synthetic windows (test seed 90210): 60 examples each of no removal,
+normal removal, sensor noise, unexpected increase, and excessive removal.
+`GET /api/sensor/model` reports actual Isolation Forest and threshold-baseline
+precision, recall, F1, confusion matrices, Isolation Forest ROC-AUC, and
+per-scenario flag rates. `GET /api/sensor/demo` additionally returns repeatable
+examples of all five scenarios. The saved artifact and JSON metrics report are
+in `instance/sensor_experiment/model.joblib` and
+`instance/sensor_experiment/model.metrics.json`; `SENSOR_MODEL_PATH` and CLI
+arguments can override the paths.
 
-The Doctor, Caregiver, and Patient portals include a live software simulator
-with a pill-box diagram, simulated HX711 graph, buzzer indicator, event
-timeline, and repeatable scenarios for normal removal, delayed removal, no
-response, sensor noise, and unexpected weight changes. Every reading is
-explicitly labelled simulated. The state machine is:
+The default held-out experiment (sensor-iforest-heldout-v2) produced Isolation
+Forest precision 0.8398, recall 0.9611, F1 0.8964, ROC-AUC 0.9529 and confusion
+matrix `[[87, 33], [7, 173]]`. Threshold anomaly flags produced precision
+0.9890, recall 0.9944 and F1 0.9917, with confusion matrix
+`[[118, 2], [1, 179]]`. Threshold rules are included as a simple
+comparison, not as a clinical detector. All measurements are on synthetic
+signals and do not establish physical-device or clinical performance.
+
+The responsive simulator has an interactive eight-slot pill box, patient and
+scheduled-dose selection, visible tablet/calibration settings, manual sample
+inputs, a raw-versus-filtered weight graph, buzzer and dose-state indicators,
+an event timeline, and detector comparison. Repeatable scenarios include
+normal removal, no removal, sensor noise, unexpected increase, excessive
+removal, delayed removal, and no response. Every reading is labelled simulated.
+The state machine is:
 
 `IDLE -> REMINDER_DUE -> ALERTING -> AWAITING_CONFIRMATION ->
 REMOVAL_DETECTED -> MANUALLY_CONFIRMED` (or `MISSED` after timeout).
@@ -257,7 +273,7 @@ returns the event timeline, and `POST /api/simulation/events/<event_id>/confirm`
 records an explicit manual confirmation. Repeated readings reuse the same
 patient/reminder/date event and caregiver notifications are sent at most once.
 
-Doctor and Caregiver views also show the last 50 raw hardware requests from
+Doctor and Caregiver views also show the last 50 sanitized hardware requests from
 `GET /api/hardware/traffic`. Weight-based removal is an intake signal only; it
 does not prove swallowing.
 
@@ -356,9 +372,11 @@ $env:SECRET_KEY = "demo-only-change-me"; $env:DATABASE_URL = "sqlite:///$((Resol
    and the distinction between recorded weight events and proof of swallowing.
 3. Log in as the Caregiver. Show the event timeline, notification, caregiver
    confirmation control, and assistant source dates.
-4. In the simulator, run `normal_removal`, `delayed_removal`, `no_response`,
-   `noise`, and `unexpected_weight`. Explain the state changes and that
-   anomalies are not consumption confirmation.
+4. In AI Insights, compare the sensor Isolation Forest to the threshold baseline
+   on held-out synthetic scenarios. In the simulator, run normal removal, no
+   removal, sensor noise, unexpected increase, excessive removal, delayed
+   removal, and no response. Explain that removal and anomaly flags are not
+   confirmation of swallowing.
 5. From a separate terminal, verify the future hardware boundary:
 
 ```powershell

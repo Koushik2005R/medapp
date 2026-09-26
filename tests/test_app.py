@@ -196,7 +196,10 @@ def test_sensor_model_metadata_requires_authentication(tmp_path):
     client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
     response = client.get("/api/sensor/model")
     assert response.status_code == 200
-    assert {"precision", "recall", "f1", "validation_limitations"} <= response.get_json().keys()
+    assert {
+        "isolation_forest", "threshold_baseline", "per_scenario",
+        "data_source", "validation_limitations", "held_out_scenarios",
+    } <= response.get_json().keys()
 
 
 def test_final_demo_smoke_covers_registration_notifications_ml_sensor_and_assistant(tmp_path):
@@ -342,10 +345,12 @@ def test_weight_event_validates_and_records(tmp_path):
     _, patient_id, device_key = seed(app)
     client = app.test_client()
     headers = {"X-Device-Key": device_key}
-    assert client.post(
+    unexpected = client.post(
         "/api/hardware/log-event", json={"patient_id": patient_id, "w_before": 1, "w_after": 2},
         headers=headers,
-    ).status_code == 400
+    )
+    assert unexpected.status_code == 200
+    assert unexpected.get_json()["sensor_analysis"]["threshold_detection"]["event"] == "unexpected_increase"
     response = client.post(
         "/api/hardware/log-event", json={"patient_id": patient_id, "w_before": 100, "w_after": 95},
         headers=headers,
@@ -353,6 +358,33 @@ def test_weight_event_validates_and_records(tmp_path):
     assert response.status_code == 200
     assert response.get_json()["state"] == "REMOVAL_DETECTED"
     assert {"threshold_detection", "anomaly_detection"} <= response.get_json()["sensor_analysis"].keys()
+
+
+def test_all_repeatable_sensor_scenarios_share_the_device_event_processor(tmp_path):
+    expected = {
+        "normal_removal": ("normal_removal", True),
+        "no_removal": ("no_removal", False),
+        "noise": ("sensor_noise", False),
+        "unexpected_increase": ("unexpected_increase", False),
+        "excessive_removal": ("excessive_removal", False),
+    }
+    for index, (scenario, (classification, removal_detected)) in enumerate(expected.items()):
+        scenario_path = tmp_path / str(index)
+        scenario_path.mkdir()
+        app = make_app(scenario_path)
+        _, patient_id, _ = seed(app)
+        client = app.test_client()
+        client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+        response = client.post(
+            "/api/simulation/scenario",
+            json={"patient_id": patient_id, "reminder_id": 1, "scenario": scenario},
+            headers={"X-CSRF-Token": csrf(client)},
+        )
+        assert response.status_code == 200
+        result = response.get_json()
+        assert result["sensor_analysis"]["threshold_detection"]["event"] == classification
+        assert result["sensor_analysis"]["threshold_detection"]["removal_detected"] is removal_detected
+        assert result["sensor_analysis"]["interpretation"].find("swallowing") >= 0
 
 
 def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):
