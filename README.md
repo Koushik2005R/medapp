@@ -99,12 +99,19 @@ weight change produces `REMOVAL_DETECTED` and then
 
 ## Dashboard
 
-Open `http://127.0.0.1:5000/` after starting Flask. The single-page Bootstrap
-dashboard selects the Doctor, Patient, or Caregiver portal from the logged-in
-user role and updates data with `fetch()` without full-page navigation. Doctors
-can link patients, assign caregivers, and sync schedules. Caregivers receive
-automatic activity refreshes, can confirm missed events manually, and can
-dispatch patient notifications.
+Open `http://127.0.0.1:5000/` for the public landing page. Sign in at `/login`
+or create a patient or caregiver account at `/register`; doctor registration
+requires an administrator invitation unless public doctor registration is
+explicitly enabled. Authenticated users are redirected to `/dashboard/doctor`,
+`/dashboard/patient`, or `/dashboard/caregiver` according to their role.
+
+The responsive dashboard provides persistent navigation for Dashboard,
+Medications, Activity, AI Insights, Messages and Settings. Doctors also have
+Patients and Requests; caregivers have Assigned Patients. Doctors can link
+patients, assign caregivers, manage medication records and review change
+requests. Patients and caregivers can submit medication changes for doctor
+approval. Caregivers receive automatic activity refreshes, can confirm missed
+events manually and dispatch patient notifications.
 
 ## Free communication
 

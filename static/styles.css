@@ -59,3 +59,53 @@ body { background: #f4f7fb; color: #172033; font-family: Inter, ui-sans-serif, s
 [data-theme="dark"] .metric-card, [data-theme="dark"] .loading-block, [data-theme="dark"] .sensor-graph { background: rgba(148,163,184,.1); }
 [data-theme="dark"] .chart-track, [data-theme="dark"] .importance-bar { background: #334155; }
 @media (max-width: 768px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .importance-row { grid-template-columns: 7rem 1fr 2.5rem; } .sensor-scenario { grid-template-columns: 1fr auto; } .sensor-scenario small { grid-column: 1 / -1; } }
+
+:root { scroll-behavior: smooth; scroll-padding-top: 6rem; }
+body { line-height: 1.55; }
+a, button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 3px solid #0b70e8 !important; outline-offset: 3px; }
+.app-nav { min-height: 4.5rem; box-shadow: 0 4px 18px rgba(15, 23, 42, .04); }
+.app-nav .nav-link { color: #475569; border-radius: .6rem; font-weight: 600; padding: .55rem .7rem; }
+.app-nav .nav-link:hover, .app-nav .nav-link.active { color: #1456d9; background: rgba(37, 99, 235, .08); }
+.app-nav .nav-link.disabled { color: #a0a9b7; cursor: not-allowed; }
+.dashboard-container { max-width: 1600px; min-height: calc(100vh - 13rem); }
+.dashboard-page #dashboardView > .d-flex { padding: 1.1rem 1.25rem; border-radius: 1rem; background: linear-gradient(110deg, rgba(37,99,235,.09), rgba(16,185,129,.06)); }
+.dashboard-page .card { transition: box-shadow .18s ease, transform .18s ease; }
+.dashboard-page .card:hover { box-shadow: 0 18px 48px rgba(30, 64, 175, .11); }
+.settings-panel { scroll-margin-top: 6rem; }
+.toast-message { position: fixed; right: 1rem; top: 5.25rem; z-index: 1080; max-width: min(28rem, calc(100vw - 2rem)); box-shadow: 0 .75rem 2rem rgba(15,23,42,.15); }
+.landing-page, .auth-page { min-height: 100vh; background: radial-gradient(ellipse at 78% 15%, rgba(16,185,129,.10), transparent 35%), #f4f7fb; }
+.landing-hero { min-height: 68vh; }
+.landing-hero h1 { letter-spacing: -.055em; color: #14213a; }
+.landing-hero .lead { max-width: 39rem; }
+.hero-preview { padding: 2rem !important; border: 1px solid rgba(37,99,235,.12) !important; border-radius: 1.4rem; box-shadow: 0 24px 70px rgba(30,64,175,.14); }
+.preview-dose { padding: 1.1rem; border: 1px solid rgba(37,99,235,.15); border-radius: .9rem; background: rgba(37,99,235,.045); }
+.preview-care { display: flex; align-items: center; gap: .85rem; padding: .8rem .2rem; border-bottom: 1px solid rgba(148,163,184,.2); }
+.preview-care:last-child { border-bottom: 0; }
+.preview-icon, .feature-icon { display: grid; place-items: center; flex: 0 0 auto; width: 2.5rem; height: 2.5rem; border-radius: .8rem; background: #e9f2ff; color: #1456d9; font-weight: 700; }
+.feature-card { padding: 1.5rem; border: 1px solid rgba(148,163,184,.22); border-radius: 1rem; background: rgba(255,255,255,.75); }
+.auth-container { min-height: calc(100vh - 9rem); display: grid; align-items: center; }
+.auth-card { border-radius: 1.2rem; }
+.auth-card .form-control, .auth-card .form-select { min-height: 3rem; }
+[aria-busy="true"] { cursor: progress; opacity: .78; }
+[data-theme="dark"] .landing-page, [data-theme="dark"] .auth-page { background: radial-gradient(ellipse at 78% 15%, rgba(16,185,129,.08), transparent 35%), #0b1220; }
+[data-theme="dark"] .landing-hero h1 { color: #e5edf8; }
+[data-theme="dark"] .feature-card, [data-theme="dark"] .preview-dose { background: #111c30; color: #e5edf8; border-color: #334155; }
+[data-theme="dark"] .app-nav .nav-link { color: #c0cce0; }
+[data-theme="dark"] .app-nav .nav-link:hover, [data-theme="dark"] .app-nav .nav-link.active { color: #93c5fd; background: rgba(37,99,235,.18); }
+@media (max-width: 991.98px) {
+  .app-nav .navbar-collapse { padding: .75rem 0; }
+  .app-nav .navbar-nav { padding-bottom: .75rem; }
+  .app-nav .nav-link { padding: .7rem .8rem; }
+  .dashboard-page #dashboardView > .d-flex { align-items: flex-start !important; flex-direction: column; gap: .75rem; }
+}
+@media (max-width: 575.98px) {
+  .landing-hero { padding-top: 2rem !important; }
+  .landing-hero h1 { font-size: clamp(2.65rem, 13vw, 4rem); }
+  .hero-preview { padding: 1.25rem !important; }
+  .auth-container { min-height: calc(100vh - 5rem); }
+  .toast-message { top: 1rem; right: .75rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

@@ -24,7 +24,7 @@ from functools import wraps
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Flask, jsonify, render_template, request, session
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
@@ -1137,6 +1137,42 @@ def scheduled_alarm_is_acknowledged(patient_id: int) -> bool:
 def register_routes(app: Flask) -> None:
     @app.get("/")
     def index():
+        if current_user() is not None:
+            return redirect(url_for("dashboard"))
+        return render_template("landing.html")
+
+    @app.get("/login")
+    def login_page():
+        if current_user() is not None:
+            return redirect(url_for("dashboard"))
+        return render_template("auth.html", mode="login")
+
+    @app.get("/register")
+    def register_page():
+        if current_user() is not None:
+            return redirect(url_for("dashboard"))
+        return render_template(
+            "auth.html",
+            mode="register",
+            allow_public_doctor_registration=os.environ.get("ALLOW_PUBLIC_DOCTOR_REGISTRATION", "").lower() == "true",
+        )
+
+    @app.get("/dashboard")
+    def dashboard():
+        user = current_user()
+        if user is None:
+            return redirect(url_for("login_page"))
+        role_pages = {"Doctor": "doctor", "Patient": "patient", "Caregiver": "caregiver"}
+        return redirect(url_for("role_dashboard", role=role_pages[user.role]))
+
+    @app.get("/dashboard/<role>")
+    def role_dashboard(role: str):
+        user = current_user()
+        if user is None:
+            return redirect(url_for("login_page"))
+        role_pages = {"Doctor": "doctor", "Patient": "patient", "Caregiver": "caregiver"}
+        if role_pages.get(user.role) != role:
+            return redirect(url_for("role_dashboard", role=role_pages[user.role]))
         return render_template("index.html")
 
     @app.get("/.well-known/appspecific/com.chrome.devtools.json")

@@ -249,6 +249,53 @@ def test_all_role_dashboards_remain_available(tmp_path):
         assert client.get(endpoint).status_code == 200
 
 
+def test_landing_auth_and_role_dashboard_page_journeys(tmp_path):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    with app.app_context():
+        caregiver = User(
+            name="Caregiver", email="c@example.com", role="Caregiver",
+            password_hash="",
+        )
+        caregiver.set_password("password123")
+        db.session.add(caregiver)
+        db.session.flush()
+        db.session.get(User, patient_id).linked_caregiver_id = caregiver.id
+        db.session.commit()
+
+    public = app.test_client()
+    assert b"Medication care" in public.get("/").data
+    assert b'id="loginForm"' in public.get("/login").data
+    registration = public.get("/register")
+    assert b'id="signupForm"' in registration.data
+    assert b"<option>Doctor</option>" not in registration.data
+    assert public.get("/dashboard").headers["Location"].endswith("/login")
+
+    for email, expected_page, role_nav in (
+        ("doctor@example.com", "/dashboard/doctor", b'data-role-nav="Doctor"'),
+        ("patient@example.com", "/dashboard/patient", b'data-section="medications"'),
+        ("c@example.com", "/dashboard/caregiver", b'data-role-nav="Caregiver"'),
+    ):
+        client = app.test_client()
+        assert client.get(expected_page).headers["Location"].endswith("/login")
+        assert client.post(
+            "/api/login", json={"email": email, "password": "password123"}
+        ).status_code == 200
+        assert client.get("/dashboard").headers["Location"].endswith(expected_page)
+        response = client.get(expected_page)
+        assert response.status_code == 200
+        assert b"Dashboard" in response.data
+        assert b"Medications" in response.data
+        assert b"Activity" in response.data
+        assert b"AI Insights" in response.data
+        assert b"Messages" in response.data
+        assert b"Settings" in response.data
+        assert role_nav in response.data
+    patient_client = app.test_client()
+    patient_client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    assert patient_client.get("/dashboard/doctor").headers["Location"].endswith("/dashboard/patient")
+
+
 def test_assistant_is_authorized_grounded_and_csrf_protected(tmp_path):
     app = make_app(tmp_path)
     doctor_id, patient_id, _ = seed(app)
