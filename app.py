@@ -2192,6 +2192,105 @@ def register_routes(app: Flask) -> None:
         db.session.commit()
         return jsonify({"status": "success", "schedule": reminder.to_dict()}), 201
 
+    @app.patch("/api/doctor/patients/<int:patient_id>/schedules/<int:reminder_id>")
+    @role_required("Doctor", "Caregiver")
+    def update_schedule(patient_id: int, reminder_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None:
+            return json_error("patient not found", 404)
+        can_edit = (
+            actor.role == "Doctor" and patient.linked_doctor_id == actor.id
+        ) or (
+            actor.role == "Caregiver" and patient.linked_caregiver_id == actor.id
+        )
+        if not can_edit:
+            return json_error("only the patient's assigned doctor or caregiver can edit schedules", 403)
+        reminder = db.session.scalar(db.select(Reminder).where(
+            Reminder.id == reminder_id,
+            Reminder.patient_id == patient.id,
+        ))
+        if reminder is None or reminder.status != "Active":
+            return json_error("active schedule not found", 404)
+        data = request.get_json(silent=True) or {}
+        allowed_fields = {"med_name", "time", "dosage", "compartment"}
+        if not isinstance(data, dict) or set(data) - allowed_fields:
+            return json_error("schedule data contains unsupported fields", 400)
+        values = {
+            {"med_name": "name"}.get(field, field): value
+            for field, value in data.items()
+        }
+        if isinstance(values.get("compartment"), str):
+            values["compartment"] = values["compartment"].strip() or None
+        normalized, error = normalize_medication_data(values, "EDIT")
+        if error:
+            return json_error(error, 400)
+        medication = reminder.medication
+        before_data = medication_snapshot(medication) if medication is not None else None
+        if "name" in normalized and medication is not None:
+            duplicate = db.session.scalar(db.select(Medication.id).where(
+                Medication.patient_id == patient.id,
+                Medication.id != medication.id,
+                Medication.status == "Active",
+                db.func.lower(Medication.name) == normalized["name"].lower(),
+            ))
+            if duplicate is not None:
+                return json_error("an active medication with this name already exists", 409)
+        for field in ("time", "dosage", "compartment"):
+            if field in normalized:
+                setattr(reminder, field, normalized[field])
+        if "name" in normalized:
+            reminder.med_name = normalized["name"]
+            if medication is not None:
+                medication.name = normalized["name"]
+                medication.updated_at = utc_now()
+        if medication is not None:
+            add_medication_audit(
+                patient.id, actor.id, "SCHEDULE_UPDATED", medication,
+                before_data,
+            )
+        _queue_patient_event(
+            patient, "schedule_updated",
+            {"patient_id": patient.id, "schedule": reminder.to_dict()},
+        )
+        db.session.commit()
+        return jsonify({"status": "success", "schedule": reminder.to_dict()})
+
+    @app.post("/api/doctor/patients/<int:patient_id>/schedules/<int:reminder_id>/deactivate")
+    @role_required("Doctor", "Caregiver")
+    def deactivate_schedule(patient_id: int, reminder_id: int):
+        actor = current_user()
+        patient = get_patient(patient_id)
+        if patient is None:
+            return json_error("patient not found", 404)
+        can_edit = (
+            actor.role == "Doctor" and patient.linked_doctor_id == actor.id
+        ) or (
+            actor.role == "Caregiver" and patient.linked_caregiver_id == actor.id
+        )
+        if not can_edit:
+            return json_error("only the patient's assigned doctor or caregiver can deactivate schedules", 403)
+        reminder = db.session.scalar(db.select(Reminder).where(
+            Reminder.id == reminder_id,
+            Reminder.patient_id == patient.id,
+        ))
+        if reminder is None or reminder.status != "Active":
+            return json_error("active schedule not found", 404)
+        reminder.status = "Completed"
+        if reminder.medication is not None:
+            before_data = medication_snapshot(reminder.medication)
+            reminder.medication.updated_at = utc_now()
+            add_medication_audit(
+                patient.id, actor.id, "SCHEDULE_DEACTIVATED", reminder.medication,
+                before_data,
+            )
+        _queue_patient_event(
+            patient, "schedule_updated",
+            {"patient_id": patient.id, "schedule": reminder.to_dict()},
+        )
+        db.session.commit()
+        return jsonify({"status": "success", "schedule": reminder.to_dict()})
+
     @app.get("/api/patient/dashboard")
     @role_required("Patient")
     def patient_dashboard():
