@@ -1,4 +1,4 @@
-const state = { user: null, timer: null, alarmTimer: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, alarmKeys: new Set(), schedules: [], csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
+const state = { user: null, timer: null, eventSource: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
@@ -128,22 +128,31 @@ function localDateKey(now, timezone) {
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
 }
-function scheduleKey(patientId, reminder, timezone, now) {
-  return `${localDateKey(now, timezone)}:${patientId}:${reminder.id}:${reminder.time}`;
-}
-function checkAlarms() {
-  const now = new Date();
-  state.schedules.forEach(({patientId, reminder, patientName, timezone}) => {
-    const parts = new Intl.DateTimeFormat('en-GB', {timeZone: timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'}).formatToParts(now);
-    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-    const current = `${values.hour}:${values.minute}`;
-    const key = scheduleKey(patientId, reminder, timezone, now);
-    if (reminder.time === current && !state.alarmKeys.has(key)) { state.alarmKeys.add(key); triggerAlarm(patientId, reminder, patientName); }
-  });
-}
-function configureAlarms(schedules) {
-  state.schedules = schedules.flatMap((item) => (item.reminders || item.schedules || []).map((reminder) => ({patientId: item.id, reminder, patientName: item.name || state.user.name, timezone: item.timezone || reminder.timezone || 'UTC'})));
-  if (!state.alarmTimer) state.alarmTimer = setInterval(checkAlarms, 1000);
+function configureAlarms() {
+  if (!state.eventSource) {
+    state.eventSource = new EventSource('/api/stream');
+    state.eventSource.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data);
+        if (event.type !== 'alarm') return;
+        const payload = event.payload;
+        const reminder = {
+          id: payload.reminder_id,
+          med_name: payload.med_name,
+          dosage: payload.dosage,
+          time: payload.time,
+          compartment: payload.compartment,
+        };
+        if (state.user.role === 'Patient' && payload.patient_id === state.user.id) {
+          triggerAlarm(payload.patient_id, reminder);
+        } else {
+          notify(`Alarm fired for ${payload.med_name} at ${payload.time}.`, 'info');
+        }
+      } catch (error) {
+        notify(`Alarm event could not be read: ${error.message}`, 'danger');
+      }
+    };
+  }
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
 }
 function startNextDoseCountdown(nextDose) {
@@ -598,7 +607,7 @@ async function loadDoctor() {
   bindSimulation(patients);
   bindDoctorMedicationPanel();
   if (patients[0]) bindAiLab(patients[0].id);
-  configureAlarms(patients);
+  configureAlarms();
   bindSectionNavigation('Doctor');
 }
 function riskBadge(risk) { const tone = risk.level === 'HIGH' ? 'danger' : risk.level === 'MEDIUM' ? 'warning' : risk.level === 'INSUFFICIENT_DATA' ? 'secondary' : 'success'; return `<span class="badge text-bg-${tone}">${risk.level === 'INSUFFICIENT_DATA' ? 'Awaiting history' : `Adherence risk: ${Number(risk.risk_score).toFixed(1)}% ${esc(risk.level)}`}</span>`; }
@@ -650,7 +659,7 @@ async function loadPatient() {
   bindCommunication([{id: state.user.id, name: 'My care team'}], state.user.id);
   bindMedicationPanels(state.user.id);
   bindSimulation([{id: state.user.id, name: 'My account', schedules: data.schedules}]);
-  configureAlarms([{id: state.user.id, timezone: data.timezone, reminders: data.schedules}]);
+  configureAlarms();
   startNextDoseCountdown(data.next_dose);
   $('#syncTimezoneBtn').onclick = async () => {
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -676,7 +685,7 @@ async function loadCaregiver() {
   bindCommunication(data.patients, data.patients[0]?.id);
   data.patients.forEach((patient) => bindMedicationPanels(patient.id));
   bindSimulation(data.patients);
-  configureAlarms(data.patients);
+  configureAlarms();
   if (selectedPatient) bindAiLab(selectedPatient.id);
   bindSectionNavigation('Caregiver');
 }

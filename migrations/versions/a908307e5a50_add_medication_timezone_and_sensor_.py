@@ -24,7 +24,7 @@ def upgrade():
     bind = op.get_bind()
     initial_tables = [
         table for name, table in db.metadata.tables.items()
-        if name not in {"medication_change_requests", "medication_audit"}
+        if name not in {"medication_change_requests", "medication_audit", "alarm_firings"}
     ]
     db.metadata.create_all(bind=bind, tables=initial_tables, checkfirst=True)
     inspector = sa.inspect(bind)

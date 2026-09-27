@@ -27,10 +27,11 @@ from functools import wraps
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
+from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, inspect as sqlalchemy_inspect, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -55,6 +56,9 @@ migrate = Migrate(compare_type=True)
 F = TypeVar("F", bound=Callable[..., Any])
 _sse_lock = threading.Lock()
 _sse_clients: dict[int, list[queue.Queue[str]]] = {}
+_scheduler_lock = threading.Lock()
+_alarm_scheduler: BackgroundScheduler | None = None
+ALARM_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 def publish_event(user_id: int, event_type: str, payload: dict[str, Any]) -> None:
@@ -206,6 +210,19 @@ class ScheduledDose(db.Model):
             "noise_threshold": self.noise_threshold,
             "timezone": self.patient.timezone,
         }
+
+
+class AlarmFiring(db.Model):
+    __tablename__ = "alarm_firings"
+    __table_args__ = (
+        UniqueConstraint("reminder_id", "firing_date", name="uq_alarm_firing_reminder_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("reminders.id"), nullable=False, index=True)
+    firing_date: Mapped[date] = mapped_column(db.Date, nullable=False)
+    fired_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), nullable=False)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(db.DateTime(timezone=True))
 
 
 Reminder = ScheduledDose
@@ -502,6 +519,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             f"sqlite:///{os.path.join(app.root_path, 'instance', 'database.db')}",
         ),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SCHEDULER_AUTOSTART=True,
     )
     if test_config:
         app.config.update(test_config)
@@ -514,7 +532,89 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     register_routes(app)
     register_csrf(app)
+    if app.config["SCHEDULER_AUTOSTART"] and not app.testing and (
+        not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    ):
+        with app.app_context():
+            if sqlalchemy_inspect(db.engine).has_table("alarm_firings"):
+                start_alarm_scheduler(app)
     return app
+
+
+def dispatch_due_alarms(app: Flask, now: datetime | None = None) -> int:
+    fired_now = as_utc(now or datetime.now(ALARM_TIMEZONE))
+    local_now = fired_now.astimezone(ALARM_TIMEZONE)
+    firing_date = local_now.date()
+    firing_time = local_now.strftime("%H:%M")
+    published: list[tuple[set[int], dict[str, Any]]] = []
+    with app.app_context():
+        reminders = db.session.scalars(db.select(Reminder).where(
+            Reminder.status == "Active",
+            Reminder.time == firing_time,
+        )).all()
+        for reminder in reminders:
+            existing = db.session.scalar(db.select(AlarmFiring.id).where(
+                AlarmFiring.reminder_id == reminder.id,
+                AlarmFiring.firing_date == firing_date,
+            ))
+            if existing is not None:
+                continue
+            try:
+                with db.session.begin_nested():
+                    firing = AlarmFiring(
+                        reminder_id=reminder.id,
+                        firing_date=firing_date,
+                        fired_at=fired_now,
+                    )
+                    db.session.add(firing)
+                    db.session.flush()
+            except IntegrityError:
+                continue
+            patient = db.session.get(User, reminder.patient_id)
+            if patient is None:
+                raise ValueError(f"reminder {reminder.id} references a missing patient")
+            recipients = {
+                patient.id,
+                patient.linked_doctor_id,
+                patient.linked_caregiver_id,
+            } - {None}
+            published.append((recipients, {
+                "patient_id": patient.id,
+                "reminder_id": reminder.id,
+                "med_name": reminder.med_name,
+                "dosage": reminder.dosage,
+                "time": reminder.time,
+                "compartment": reminder.compartment,
+                "fired_at": fired_now.isoformat(),
+            }))
+        if published:
+            db.session.commit()
+        else:
+            db.session.rollback()
+    for recipient_ids, payload in published:
+        for user_id in recipient_ids:
+            publish_event(user_id, "alarm", payload)
+    return len(published)
+
+
+def start_alarm_scheduler(app: Flask) -> None:
+    global _alarm_scheduler
+    with _scheduler_lock:
+        if _alarm_scheduler is not None and _alarm_scheduler.running:
+            return
+        scheduler = BackgroundScheduler(timezone=ALARM_TIMEZONE)
+        scheduler.add_job(
+            dispatch_due_alarms,
+            "interval",
+            seconds=15,
+            args=[app],
+            id="server-alarm-dispatcher",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+        scheduler.start()
+        _alarm_scheduler = scheduler
 
 
 def register_csrf(app: Flask) -> None:
@@ -969,6 +1069,18 @@ def event_for_occurrence(
     return event, True
 
 
+def active_alarm_firing(reminder: Reminder, when: datetime) -> AlarmFiring | None:
+    now = as_utc(when)
+    firing = db.session.scalar(db.select(AlarmFiring).where(
+        AlarmFiring.reminder_id == reminder.id,
+        AlarmFiring.fired_at <= now,
+    ).order_by(AlarmFiring.fired_at.desc()).limit(1))
+    if firing is None:
+        return None
+    fired_at = as_utc(firing.fired_at)
+    return firing if now <= fired_at + timedelta(hours=1) else None
+
+
 def refresh_due_events(patient: User, now: datetime) -> bool:
     now = as_utc(now)
     local_today = now.astimezone(patient_timezone(patient)).date()
@@ -1014,6 +1126,12 @@ def next_scheduled_dose(patient: User, now: datetime) -> dict[str, Any] | None:
 def get_or_create_dose_event(
     patient: User, reminder: Reminder, when: datetime, source: str
 ) -> DoseEvent | None:
+    firing = active_alarm_firing(reminder, when)
+    if firing is not None:
+        event, _ = event_for_occurrence(patient, reminder, as_utc(firing.fired_at), source)
+        if event.state == "REMINDER_DUE":
+            event.state = "ALERTING"
+        return event
     scheduled_at = event_schedule(patient, reminder, when)
     if scheduled_at is None:
         return None
@@ -1118,10 +1236,14 @@ def reminder_for_input(
         if len(reminders) != 1:
             return None
         reminder = reminders[0]
-        return reminder if event_schedule(reminder.patient, reminder, now) is not None else None
+        return reminder if (
+            active_alarm_firing(reminder, now) is not None
+            or event_schedule(reminder.patient, reminder, now) is not None
+        ) else None
     due = [
         reminder for reminder in reminders
-        if event_schedule(reminder.patient, reminder, now) is not None
+        if active_alarm_firing(reminder, now) is not None
+        or event_schedule(reminder.patient, reminder, now) is not None
     ]
     return due[0] if len(due) == 1 else None
 
@@ -1209,17 +1331,6 @@ def process_sensor_reading(
         analysis=sensor_analysis,
     ))
     return event, None, sensor_analysis
-
-
-def alarm_key(patient_id: int, reminder_id: int, when: datetime) -> str:
-    return f"{when.date().isoformat()}:{patient_id}:{reminder_id}:{when.hour:02d}:{when.minute:02d}"
-
-
-def scheduled_alarm_is_acknowledged(patient_id: int) -> bool:
-    return any(
-        key.startswith(f"{datetime.now(ZoneInfo('Asia/Kolkata')).date().isoformat()}:{patient_id}:")
-        for key in session.get("acknowledged_alarms", [])
-    )
 
 
 def register_routes(app: Flask) -> None:
@@ -2216,12 +2327,18 @@ def register_routes(app: Flask) -> None:
             return json_error("scheduled reminder not found", 404)
         if not can_access_patient(actor, patient):
             return json_error("You do not have access to this patient", 403)
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
-        now_utc = now.astimezone(timezone.utc)
-        scheduled_at = event_schedule(patient, reminder, now_utc, window_minutes=5)
-        if scheduled_at is None:
+        now_utc = utc_now()
+        firing = db.session.scalar(db.select(AlarmFiring).where(
+            AlarmFiring.reminder_id == reminder.id,
+        ).order_by(AlarmFiring.fired_at.desc()).limit(1))
+        if firing is None:
             return json_error("the medication reminder is not due", 409)
-        event, _ = event_for_occurrence(patient, reminder, scheduled_at, "simulation")
+        fired_at = as_utc(firing.fired_at)
+        if now_utc < fired_at or now_utc > fired_at + timedelta(hours=1):
+            return json_error("the medication reminder is not due", 409)
+        if firing.acknowledged_at is not None:
+            return json_error("this medication reminder was already acknowledged", 409)
+        event, _ = event_for_occurrence(patient, reminder, fired_at, "server_alarm")
         if event.state == "REMINDER_DUE":
             event.state = "ALERTING"
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
@@ -2230,11 +2347,7 @@ def register_routes(app: Flask) -> None:
             return json_error("the medication reminder is not due yet", 409)
         event.state = "AWAITING_CONFIRMATION"
         event.acknowledged_at = now_utc
-        acknowledged = session.setdefault("acknowledged_alarms", [])
-        key = alarm_key(patient.id, reminder.id, now)
-        if key not in acknowledged:
-            acknowledged.append(key)
-        session.modified = True
+        firing.acknowledged_at = now_utc
         db.session.commit()
         return jsonify({
             "status": "success",

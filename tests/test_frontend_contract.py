@@ -51,3 +51,10 @@ def test_dashboard_polls_preserve_active_form_inputs_and_pill_state_is_associate
         assert f"if (isEditingView('{role}')) return;" in javascript
     assert "String(log.reminder_id) === String(item.id)" in javascript
     assert "Number(log.compartment) === Number(compartment)" in javascript
+
+
+def test_alarm_delivery_uses_server_sent_events_instead_of_browser_clock_matching():
+    javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    assert "new EventSource('/api/stream')" in javascript
+    assert "event.type !== 'alarm'" in javascript
+    assert "function checkAlarms()" not in javascript

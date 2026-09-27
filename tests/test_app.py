@@ -2,10 +2,12 @@ import os
 import json
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 
 from app import (
+    AlarmFiring,
     Device,
     DoseEvent,
     HardwareTraffic,
@@ -18,6 +20,7 @@ from app import (
     create_app,
     create_pill_log,
     db,
+    dispatch_due_alarms,
     event_schedule,
     local_occurrence,
     reminder_for_input,
@@ -62,6 +65,17 @@ def csrf(client):
     return client.get("/api/csrf-token").get_json()["csrf_token"]
 
 
+def record_firing(app, reminder_id=1, fired_at=None):
+    fired_at = fired_at or utc_now()
+    with app.app_context():
+        db.session.add(AlarmFiring(
+            reminder_id=reminder_id,
+            firing_date=fired_at.astimezone(ZoneInfo("Asia/Kolkata")).date(),
+            fired_at=fired_at,
+        ))
+        db.session.commit()
+
+
 def test_login_and_csrf_protect_mutations(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)
@@ -75,6 +89,32 @@ def test_login_and_csrf_protect_mutations(tmp_path):
         headers={"X-CSRF-Token": token},
     )
     assert response.status_code == 201
+
+
+def test_alarm_dispatcher_persists_and_broadcasts_once_per_local_date(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    fired_at = datetime(2026, 9, 27, 2, 30, tzinfo=timezone.utc)
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = "08:00"
+        db.session.commit()
+
+    received = []
+    monkeypatch.setattr(
+        "app.publish_event",
+        lambda user_id, event_type, payload: received.append((user_id, event_type, payload)),
+    )
+    assert dispatch_due_alarms(app, fired_at) == 1
+    assert dispatch_due_alarms(app, fired_at + timedelta(seconds=15)) == 0
+    assert {item[0] for item in received} == {doctor_id, patient_id}
+    assert all(item[1] == "alarm" for item in received)
+    assert all(item[2]["med_name"] == "Medicine" for item in received)
+    with app.app_context():
+        firing = db.session.scalar(db.select(AlarmFiring))
+        assert firing.fired_at == fired_at.replace(tzinfo=None)
+        assert firing.firing_date.isoformat() == "2026-09-27"
+        assert firing.acknowledged_at is None
 
 
 def test_sse_stream_broadcasts_committed_schedule_and_log_events_to_each_tab(tmp_path):
@@ -728,6 +768,7 @@ def test_all_repeatable_sensor_scenarios_share_the_device_event_processor(tmp_pa
 def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)
+    record_firing(app)
     client = app.test_client()
     client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
     token = csrf(client)
@@ -738,6 +779,13 @@ def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):
     )
     assert response.status_code == 200
     assert response.get_json()["state"] == "AWAITING_CONFIRMATION"
+    with app.app_context():
+        assert db.session.scalar(db.select(AlarmFiring)).acknowledged_at is not None
+    assert client.post(
+        "/api/alarm/acknowledge",
+        json={"patient_id": patient_id, "reminder_id": 1},
+        headers={"X-CSRF-Token": token},
+    ).status_code == 409
     response = client.post(
         "/api/simulation/log-event",
         json={"patient_id": patient_id, "reminder_id": 1, "w_before": 100, "w_after": 95,
@@ -764,6 +812,7 @@ def test_alarm_acknowledgement_and_weight_use_shared_event(tmp_path):
 def test_small_weight_change_does_not_classify_dose_as_removed(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)
+    record_firing(app)
     client = app.test_client()
     client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
     token = csrf(client)
@@ -859,13 +908,10 @@ def test_schedule_time_validation_and_authorization(tmp_path):
     assert doctor_id == 1
 
 
-def test_alarm_acknowledgement_accepts_only_within_five_minutes_of_schedule(tmp_path):
+def test_alarm_acknowledgement_rejects_firing_older_than_one_hour(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)
-    with app.app_context():
-        reminder = db.session.get(Reminder, 1)
-        reminder.time = (utc_now() - timedelta(minutes=6)).strftime("%H:%M")
-        db.session.commit()
+    record_firing(app, fired_at=utc_now() - timedelta(hours=1, seconds=1))
 
     client = app.test_client()
     client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
@@ -877,14 +923,15 @@ def test_alarm_acknowledgement_accepts_only_within_five_minutes_of_schedule(tmp_
     assert response.status_code == 409
 
 
-def test_alarm_acknowledgement_uses_five_minutes_even_with_shorter_response_window(tmp_path):
+def test_alarm_acknowledgement_uses_persisted_firing_not_schedule_time(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)
     with app.app_context():
         reminder = db.session.get(Reminder, 1)
-        reminder.time = (utc_now() - timedelta(minutes=3)).strftime("%H:%M")
+        reminder.time = "00:00"
         reminder.response_window_minutes = 1
         db.session.commit()
+    record_firing(app, fired_at=utc_now() - timedelta(minutes=3))
 
     client = app.test_client()
     client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})

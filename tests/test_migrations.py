@@ -80,7 +80,7 @@ def test_upgrade_preserves_legacy_rows_and_backfills_normalized_models(tmp_path)
         assert legacy_log.remarks == "legacy record"
         assert payload == '{"patient_id":1,"w_before":100}'
         assert traffic_patient_id == patient.id
-        assert db.session.scalar(db.text("SELECT version_num FROM alembic_version")) == "9e09a6d778d7"
+        assert db.session.scalar(db.text("SELECT version_num FROM alembic_version")) == "4f9a2c6d81be"
         assert db.session.scalar(db.text(
             "SELECT recipient_id FROM notifications WHERE id = 1"
         )) is None
@@ -122,4 +122,5 @@ def test_upgrade_creates_current_schema_from_empty_database(tmp_path):
             "medication_change_requests",
             "medication_audit",
             "notifications",
+            "alarm_firings",
         } <= tables
