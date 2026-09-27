@@ -16,6 +16,7 @@ import hashlib
 import secrets
 import re
 import smtplib
+import urllib.error
 import urllib.request
 from statistics import median
 from datetime import date, datetime, time, timedelta, timezone
@@ -824,8 +825,11 @@ def dispatch_alert(patient: User, message: str) -> str:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {textbee_key}"},
             method="POST",
         )
-        with urllib.request.urlopen(payload, timeout=10):
-            return "textbee"
+        try:
+            with urllib.request.urlopen(payload, timeout=10):
+                return "textbee"
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
 
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_user = os.environ.get("SMTP_USER")
@@ -880,15 +884,16 @@ def local_occurrence(patient: User, reminder: Reminder, local_date: date) -> dat
 
 
 def event_schedule(
-    patient: User, reminder: Reminder, when: datetime
+    patient: User, reminder: Reminder, when: datetime, window_minutes: int | None = None
 ) -> datetime | None:
     now = as_utc(when).astimezone(patient_timezone(patient))
+    response_window = reminder.response_window_minutes if window_minutes is None else window_minutes
     candidates = [
         occurrence
         for local_date in (now.date() - timedelta(days=1), now.date(), now.date() + timedelta(days=1))
         if (occurrence := local_occurrence(patient, reminder, local_date)) is not None
         and occurrence <= as_utc(when)
-        and as_utc(when) <= occurrence + timedelta(minutes=reminder.response_window_minutes)
+        and as_utc(when) <= occurrence + timedelta(minutes=response_window)
     ]
     return max(candidates) if candidates else None
 
@@ -1158,7 +1163,7 @@ def alarm_key(patient_id: int, reminder_id: int, when: datetime) -> str:
 
 def scheduled_alarm_is_acknowledged(patient_id: int) -> bool:
     return any(
-        key.startswith(f"{datetime.now().date().isoformat()}:{patient_id}:")
+        key.startswith(f"{datetime.now(ZoneInfo('Asia/Kolkata')).date().isoformat()}:{patient_id}:")
         for key in session.get("acknowledged_alarms", [])
     )
 
@@ -1920,6 +1925,8 @@ def register_routes(app: Flask) -> None:
         data = request.get_json(silent=True) or {}
         med_name, reminder_time, dosage = data.get("med_name"), data.get("time"), data.get("dosage")
         compartment = data.get("compartment")
+        if isinstance(compartment, str):
+            compartment = compartment.strip() or None
         tablet_weight = data.get("tablet_weight", 0.5)
         expected_quantity = data.get("expected_quantity", 1)
         tolerance = data.get("tolerance", 0.2)
@@ -2119,16 +2126,20 @@ def register_routes(app: Flask) -> None:
             return json_error("scheduled reminder not found", 404)
         if not can_access_patient(actor, patient):
             return json_error("You do not have access to this patient", 403)
-        now = utc_now()
-        event = get_or_create_dose_event(patient, reminder, now, "simulation")
-        if event is None:
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        now_utc = now.astimezone(timezone.utc)
+        scheduled_at = event_schedule(patient, reminder, now_utc, window_minutes=5)
+        if scheduled_at is None:
             return json_error("the medication reminder is not due", 409)
+        event, _ = event_for_occurrence(patient, reminder, scheduled_at, "simulation")
+        if event.state == "REMINDER_DUE":
+            event.state = "ALERTING"
         if event.state in {"MISSED", "MANUALLY_CONFIRMED"}:
             return json_error("this scheduled dose is already closed", 409)
         if event.state == "IDLE":
             return json_error("the medication reminder is not due yet", 409)
         event.state = "AWAITING_CONFIRMATION"
-        event.acknowledged_at = now
+        event.acknowledged_at = now_utc
         acknowledged = session.setdefault("acknowledged_alarms", [])
         key = alarm_key(patient.id, reminder.id, now)
         if key not in acknowledged:

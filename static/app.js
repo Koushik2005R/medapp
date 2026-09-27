@@ -68,12 +68,26 @@ function toggleTheme() {
   $('#themeToggle').textContent = next === 'dark' ? '☀' : '☾';
 }
 function showOnly(id) { ['doctorView','patientView','caregiverView'].forEach((item) => $(`#${item}`).classList.toggle('d-none', item !== id)); }
+function isEditingView(id) {
+  const view = $(`#${id}`);
+  const active = document.activeElement;
+  return view.contains(active) && (
+    active.matches('input, textarea, select, [contenteditable="true"]') ||
+    active.closest('form')
+  );
+}
 function empty(message) { return `<div class="text-secondary text-center py-4">${esc(message)}</div>`; }
 function pillBox(schedules, logs = []) {
   return `<div class="card border-0 shadow-sm p-4 mb-4"><h2 class="h5 mb-3">Interactive Pill Box</h2><div class="pill-box">${schedules.slice(0, 8).map((item, index) => {
     const today = localDateKey(new Date(), item.timezone || 'UTC');
-    const taken = logs.some((log) => log.reminder_id === item.id && ['Taken', 'Manual Override'].includes(log.status) && localDateKey(new Date(log.timestamp), item.timezone || 'UTC') === today);
     const compartment = item.compartment ?? index + 1;
+    const taken = logs.some((log) => {
+      const matchesReminder = log.reminder_id != null
+        ? String(log.reminder_id) === String(item.id)
+        : log.compartment != null && Number(log.compartment) === Number(compartment);
+      return matchesReminder && ['Taken', 'Manual Override'].includes(log.status) &&
+        localDateKey(new Date(log.timestamp), item.timezone || 'UTC') === today;
+    });
     return `<div class="pill-compartment ${taken ? 'taken' : ''}" data-compartment="${compartment}"><div class="pill-icon ${taken ? 'removed' : ''}" data-pill="${compartment}">${taken ? '' : '💊'}</div><div class="small fw-semibold">Compartment ${compartment}</div><div class="small text-secondary">${esc(item.time)} · ${taken ? 'Empty / Taken' : esc(item.med_name)}</div></div>`;
   }).join('') || empty('No active compartments scheduled.')}</div></div>`;
 }
@@ -568,6 +582,7 @@ function bindDoctorMedicationPanel() {
 
 async function loadDoctor() {
   const data = await api('/api/doctor/patients'); showOnly('doctorView');
+  if (isEditingView('doctorView')) return;
   const patients = data.patients;
   setAssistantContext(patients, patients[0]?.id);
   $('#doctorView').innerHTML = `<div class="row g-4">
@@ -624,6 +639,7 @@ function patientCard(patient) { const latest = patient.logs?.[0]; return `<artic
 
 async function loadPatient() {
   const data = await api('/api/patient/dashboard'); showOnly('patientView');
+  if (isEditingView('patientView')) return;
   if (data.logs[0] && ['Taken', 'Manual Override'].includes(data.logs[0].status)) {
     stopBuzzer();
   }
@@ -651,6 +667,7 @@ function scheduleCard(item) { return `<div class="col-md-6"><div class="border r
 
 async function loadCaregiver() {
   const data = await api('/api/caregiver/dashboard'); showOnly('caregiverView');
+  if (isEditingView('caregiverView')) return;
   const selectedPatient = data.patients[0];
   setAssistantContext(data.patients, data.patients[0]?.id);
   $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div>${data.patients.map((patient) => medicationRecordsPanel(patient.id, patient.medications || [], patient.medication_requests || [], true)).join('')}<div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : emptyAiPanel('AI Insights will be available when a patient is assigned.')}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;

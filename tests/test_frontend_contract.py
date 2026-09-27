@@ -42,3 +42,12 @@ def test_role_navigation_and_responsive_dashboard_contracts():
     javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert "Start a software-only scenario" in javascript
     assert "startSimulationButton.onclick = unlockSimulation" in javascript
+
+
+def test_dashboard_polls_preserve_active_form_inputs_and_pill_state_is_associated():
+    javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function isEditingView(id)" in javascript
+    for role in ("doctorView", "patientView", "caregiverView"):
+        assert f"if (isEditingView('{role}')) return;" in javascript
+    assert "String(log.reminder_id) === String(item.id)" in javascript
+    assert "Number(log.compartment) === Number(compartment)" in javascript

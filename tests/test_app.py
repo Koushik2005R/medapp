@@ -1,4 +1,5 @@
 import os
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
@@ -792,4 +793,78 @@ def test_schedule_time_validation_and_authorization(tmp_path):
         headers={"X-CSRF-Token": token},
     )
     assert response.status_code == 400
+    response = client.post(
+        f"/api/doctor/patients/{patient_id}/schedules",
+        json={
+            "med_name": "Unassigned compartment medicine",
+            "time": "09:30",
+            "dosage": "1 tablet",
+            "compartment": "   ",
+        },
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 201
+    assert response.get_json()["schedule"]["compartment"] is None
     assert doctor_id == 1
+
+
+def test_alarm_acknowledgement_accepts_only_within_five_minutes_of_schedule(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = (utc_now() - timedelta(minutes=6)).strftime("%H:%M")
+        db.session.commit()
+
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = client.post(
+        "/api/alarm/acknowledge",
+        json={"patient_id": patient_id, "reminder_id": 1},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 409
+
+
+def test_alarm_acknowledgement_uses_five_minutes_even_with_shorter_response_window(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = (utc_now() - timedelta(minutes=3)).strftime("%H:%M")
+        reminder.response_window_minutes = 1
+        db.session.commit()
+
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = client.post(
+        "/api/alarm/acknowledge",
+        json={"patient_id": patient_id, "reminder_id": 1},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 200
+
+
+def test_textbee_network_failure_falls_back_to_in_app_alert(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    monkeypatch.setenv("TEXTBEE_API_URL", "https://textbee.invalid")
+    monkeypatch.setenv("TEXTBEE_API_KEY", "test-key")
+    monkeypatch.setenv("PATIENT_PHONE", "+10000000000")
+    monkeypatch.delenv("SMTP_HOST", raising=False)
+    monkeypatch.delenv("SMTP_USER", raising=False)
+    monkeypatch.delenv("SMTP_PASSWORD", raising=False)
+
+    def fail_network(*args, **kwargs):
+        raise urllib.error.URLError("network unavailable")
+
+    monkeypatch.setattr("app.urllib.request.urlopen", fail_network)
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = client.post(
+        "/api/notify/alert",
+        json={"patient_id": patient_id, "message": "Medication reminder"},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["delivery"] == "in_app"
