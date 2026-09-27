@@ -63,3 +63,15 @@ def test_alarm_delivery_uses_server_sent_events_instead_of_browser_clock_matchin
     assert "state.eventSource.onerror = () => setStreamStatus(true)" in javascript
     assert "Live updates reconnecting…" in javascript
     assert "state.eventSource.close()" in javascript
+
+
+def test_alarm_audio_is_unlocked_by_login_gesture_with_vibration_fallback():
+    javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'id="alarmSoundPrompt"' in template
+    assert 'id="enableAlarmSound"' in template
+    assert "Notification.requestPermission()" in javascript
+    assert "state.audioUnlocked = context.state === 'running'" in javascript
+    assert "context.resume()" in javascript
+    assert "navigator.vibrate([500, 200, 500])" in javascript
+    assert "navigator.vibrate?.(0)" in javascript

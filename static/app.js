@@ -1,4 +1,4 @@
-const state = { user: null, timer: null, eventSource: null, alarmTimer: null, fallbackAlarmKeys: new Set(), dashboardData: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
+const state = { user: null, timer: null, eventSource: null, alarmTimer: null, fallbackAlarmKeys: new Set(), dashboardData: null, countdownTimer: null, alarmAudio: null, audioContext: null, audioUnlocked: false, vibrationTimer: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
@@ -23,6 +23,7 @@ function shell(role, name) {
   $('#userLabel').textContent = name;
   $('#settingsName').textContent = name;
   $('#settingsRole').textContent = role;
+  $('#alarmSoundPrompt')?.classList.remove('d-none');
   document.querySelectorAll('[data-role-nav]').forEach((item) => item.classList.toggle('d-none', item.dataset.roleNav !== role));
 }
 function closeEventStream() {
@@ -112,21 +113,70 @@ function pillBoxContents(schedules, logs = []) {
     return `<div class="pill-compartment ${taken ? 'taken' : ''}" data-compartment="${compartment}"><div class="pill-icon ${taken ? 'removed' : ''}" data-pill="${compartment}">${taken ? '' : '💊'}</div><div class="small fw-semibold">Compartment ${compartment}</div><div class="small text-secondary">${esc(item.time)} · ${taken ? 'Empty / Taken' : esc(item.med_name)}</div></div>`;
   }).join('') || empty('No active compartments scheduled.')}`;
 }
+async function enableAlarmSound() {
+  const prompt = $('#alarmSoundPrompt');
+  try {
+    const permissionRequest = 'Notification' in window && Notification.permission === 'default'
+      ? Notification.requestPermission()
+      : Promise.resolve('Notification' in window ? Notification.permission : 'unsupported');
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (AudioContext && !state.audioContext) state.audioContext = new AudioContext();
+    if (state.audioContext) {
+      const context = state.audioContext;
+      const silentGain = context.createGain();
+      silentGain.gain.value = 0;
+      const silentSource = context.createBufferSource();
+      silentSource.buffer = context.createBuffer(1, 1, context.sampleRate);
+      silentSource.connect(silentGain);
+      silentGain.connect(context.destination);
+      silentSource.start();
+      const resume = context.resume();
+      await Promise.all([resume, permissionRequest]);
+      state.audioUnlocked = context.state === 'running';
+    } else {
+      await permissionRequest;
+    }
+    prompt?.classList.add('d-none');
+    notify(state.audioUnlocked ? 'Alarm sound and notifications enabled for this tab.' : 'Notification permission requested; audio is unavailable on this device.', 'info');
+  } catch (error) {
+    notify(`Could not enable alarm audio: ${error.message}`, 'warning');
+  }
+}
+function startVibration() {
+  if (!navigator.vibrate || state.vibrationTimer) return;
+  const vibrate = () => navigator.vibrate([500, 200, 500]);
+  vibrate();
+  state.vibrationTimer = setInterval(vibrate, 1400);
+}
 function startBuzzer() {
-  if (state.alarmAudio) return;
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContext) return;
-  const context = new AudioContext();
-  const oscillator = context.createOscillator();
-  const gain = context.createGain();
-  oscillator.type = 'square'; oscillator.frequency.value = 880; gain.gain.value = .04;
-  oscillator.connect(gain); gain.connect(context.destination); oscillator.start();
-  state.alarmAudio = { context, oscillator, gain };
-  state.alarmAudio.interval = setInterval(() => { oscillator.frequency.value = oscillator.frequency.value === 880 ? 660 : 880; }, 500);
+  startVibration();
+  const context = state.audioContext;
+  if (!context || state.alarmAudio) return;
+  const beginTone = () => {
+    if (state.alarmAudio || context.state !== 'running') return;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = 'square'; oscillator.frequency.value = 880; gain.gain.value = .04;
+    oscillator.connect(gain); gain.connect(context.destination); oscillator.start();
+    state.alarmAudio = { context, oscillator, gain };
+    state.alarmAudio.interval = setInterval(() => { oscillator.frequency.value = oscillator.frequency.value === 880 ? 660 : 880; }, 500);
+  };
+  if (context.state === 'suspended') {
+    context.resume().then(beginTone).catch((error) => console.warn('Alarm audio resume failed:', error));
+  } else {
+    beginTone();
+  }
 }
 function stopBuzzer() {
-  if (!state.alarmAudio) return;
-  clearInterval(state.alarmAudio.interval); state.alarmAudio.gain.gain.exponentialRampToValueAtTime(.001, state.alarmAudio.context.currentTime + .1); state.alarmAudio.oscillator.stop(state.alarmAudio.context.currentTime + .12); state.alarmAudio.context.close(); state.alarmAudio = null;
+  if (state.alarmAudio) {
+    clearInterval(state.alarmAudio.interval);
+    state.alarmAudio.gain.gain.exponentialRampToValueAtTime(.001, state.alarmAudio.context.currentTime + .1);
+    state.alarmAudio.oscillator.stop(state.alarmAudio.context.currentTime + .12);
+    state.alarmAudio = null;
+  }
+  if (state.vibrationTimer) clearInterval(state.vibrationTimer);
+  state.vibrationTimer = null;
+  navigator.vibrate?.(0);
 }
 function unlockSimulation() {
   state.simulationUnlocked = true;
@@ -211,7 +261,6 @@ function configureAlarms() {
     };
   }
   if (!state.alarmTimer) state.alarmTimer = setInterval(checkAlarms, 1000);
-  if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
 }
 function rememberDashboard(data) {
   state.dashboardData = data;
@@ -955,6 +1004,10 @@ if (settingsThemeButton) settingsThemeButton.onclick = toggleTheme;
 if (themeButton) themeButton.textContent = theme === 'dark' ? '☀' : '☾';
 const aboutButton = $('#aboutBtn');
 if (aboutButton) aboutButton.onclick = () => bootstrap.Modal.getOrCreateInstance($('#aboutModal')).show();
+const enableAlarmSoundButton = $('#enableAlarmSound');
+if (enableAlarmSoundButton) enableAlarmSoundButton.onclick = enableAlarmSound;
+const dismissAlarmSoundButton = $('#dismissAlarmSound');
+if (dismissAlarmSoundButton) dismissAlarmSoundButton.onclick = () => $('#alarmSoundPrompt')?.classList.add('d-none');
 bindAssistantWidget();
 if ($('#dashboardView')) {
   api('/api/me').then(async (data) => {
