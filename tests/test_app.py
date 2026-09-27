@@ -887,6 +887,12 @@ def test_schedule_time_validation_and_authorization(tmp_path):
     client = app.test_client()
     client.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
     token = csrf(client)
+    non_object = client.post(
+        f"/api/doctor/patients/{patient_id}/schedules",
+        json=["not", "an", "object"],
+        headers={"X-CSRF-Token": token},
+    )
+    assert non_object.status_code == 400
     response = client.post(
         f"/api/doctor/patients/{patient_id}/schedules",
         json={"med_name": "Medicine", "time": "25:99", "dosage": "1 tablet"},
@@ -961,6 +967,25 @@ def test_schedule_edits_reject_invalid_fields_and_unassigned_users(tmp_path):
         headers={"X-CSRF-Token": token},
     )
     assert invalid.status_code == 400
+    non_object = doctor.patch(
+        f"/api/doctor/patients/{patient_id}/schedules/1",
+        json=["not", "an", "object"],
+        headers={"X-CSRF-Token": token},
+    )
+    assert non_object.status_code == 400
+    unrelated_only = doctor.patch(
+        f"/api/doctor/patients/{patient_id}/schedules/1",
+        json={"unused": "field"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert unrelated_only.status_code == 400
+    clean_update = doctor.patch(
+        f"/api/doctor/patients/{patient_id}/schedules/1",
+        json={"time": "12:15", "unused": "ignored"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert clean_update.status_code == 200
+    assert clean_update.get_json()["schedule"]["time"] == "12:15"
     with app.app_context():
         outsider_user = User(name="Other Doctor", email="other@example.com", role="Doctor", password_hash="")
         outsider_user.set_password("password123")
