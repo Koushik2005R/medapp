@@ -322,6 +322,32 @@ def test_final_demo_smoke_covers_registration_notifications_ml_sensor_and_assist
     assert assistant.get_json()["intent"] == "features"
 
 
+def test_public_doctor_registration_option_is_enabled_by_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("ALLOW_PUBLIC_DOCTOR_REGISTRATION", raising=False)
+    app = make_app(tmp_path)
+    client = app.test_client()
+    assert b"<option>Doctor</option>" not in client.get("/register").data
+    denied = client.post(
+        "/api/register",
+        json={"name": "New Doctor", "email": "new-doctor@example.com", "password": "password123", "role": "Doctor"},
+    )
+    assert denied.status_code == 403
+
+    monkeypatch.setenv("ALLOW_PUBLIC_DOCTOR_REGISTRATION", "true")
+    assert b"<option>Doctor</option>" in client.get("/register").data
+    created = client.post(
+        "/api/register",
+        json={"name": "New Doctor", "email": "new-doctor@example.com", "password": "password123", "role": "Doctor"},
+    )
+    assert created.status_code == 201
+    login = client.post(
+        "/api/login",
+        json={"email": "new-doctor@example.com", "password": "password123"},
+    )
+    assert login.status_code == 200
+    assert login.get_json()["user"]["role"] == "Doctor"
+
+
 def test_complete_role_workflow_and_session_lifecycle(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)

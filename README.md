@@ -27,6 +27,7 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
 $env:SECRET_KEY = "replace-with-a-long-random-secret"
+$env:ALLOW_PUBLIC_DOCTOR_REGISTRATION = "true"
 python scripts/demo_setup.py --reset
 $demoDb = (Resolve-Path .\instance\demo.db).Path.Replace("\", "/")
 $env:DATABASE_URL = "sqlite:///$demoDb"
@@ -48,18 +49,22 @@ PowerShell window from the project root and run:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 $env:SECRET_KEY = "replace-with-a-long-random-secret"
+$env:ALLOW_PUBLIC_DOCTOR_REGISTRATION = "true"
 Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
 Remove-Item Env:ADHERENCE_MODEL_PATH -ErrorAction SilentlyContinue
 flask --app app db upgrade
 flask --app app run --debug --with-threads
 ```
 
-Open <http://127.0.0.1:5000/register> to create your own patient or caregiver
-account, or use `/login` if you already registered. Doctor self-registration
-is disabled by default; it requires an administrator invitation, unless
-`ALLOW_PUBLIC_DOCTOR_REGISTRATION=true` is deliberately enabled. The application
-uses `instance/database.db` by default; set `DATABASE_URL` before starting Flask
-if you want to use a different database.
+Open <http://127.0.0.1:5000/register> to create a patient, caregiver, or doctor
+account, or use `/login` if you already registered. The Doctor option and
+registration endpoint are controlled by `ALLOW_PUBLIC_DOCTOR_REGISTRATION`;
+the commands above enable it. For a deployment where open doctor registration
+is not appropriate, unset the variable and provision doctor accounts through
+your approved administrator process instead. Public doctor signup is intended
+for local demo/development only. The application uses `instance/database.db`
+by default; set `DATABASE_URL` before starting Flask if you want to use a
+different database.
 
 `SECRET_KEY` is required; the application will not start with a fallback secret.
 The default database is `instance/database.db` (ignored by Git). Set `DATABASE_URL`
