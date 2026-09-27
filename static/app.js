@@ -1,4 +1,4 @@
-const state = { user: null, timer: null, eventSource: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
+const state = { user: null, timer: null, eventSource: null, alarmTimer: null, fallbackAlarmKeys: new Set(), dashboardData: null, countdownTimer: null, alarmAudio: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
@@ -24,6 +24,24 @@ function shell(role, name) {
   $('#settingsName').textContent = name;
   $('#settingsRole').textContent = role;
   document.querySelectorAll('[data-role-nav]').forEach((item) => item.classList.toggle('d-none', item.dataset.roleNav !== role));
+}
+function closeEventStream() {
+  if (state.eventSource) state.eventSource.close();
+  state.eventSource = null;
+  if (state.alarmTimer) clearInterval(state.alarmTimer);
+  state.alarmTimer = null;
+  state.fallbackAlarmKeys.clear();
+  state.dashboardData = null;
+  const status = $('#streamStatus');
+  if (status) status.classList.add('d-none');
+}
+function setStreamStatus(reconnecting) {
+  const status = $('#streamStatus');
+  if (!status) return;
+  status.textContent = reconnecting ? 'Live updates reconnecting…' : 'Live updates connected';
+  status.classList.toggle('d-none', !reconnecting);
+  status.classList.toggle('text-warning', reconnecting);
+  status.classList.toggle('text-success', !reconnecting);
 }
 function bindSectionNavigation(role) {
   const view = $(`#${role.toLowerCase()}View`);
@@ -78,7 +96,10 @@ function isEditingView(id) {
 }
 function empty(message) { return `<div class="text-secondary text-center py-4">${esc(message)}</div>`; }
 function pillBox(schedules, logs = []) {
-  return `<div class="card border-0 shadow-sm p-4 mb-4"><h2 class="h5 mb-3">Interactive Pill Box</h2><div class="pill-box">${schedules.slice(0, 8).map((item, index) => {
+  return `<div class="card border-0 shadow-sm p-4 mb-4"><h2 class="h5 mb-3">Interactive Pill Box</h2><div class="pill-box">${pillBoxContents(schedules, logs)}</div></div>`;
+}
+function pillBoxContents(schedules, logs = []) {
+  return `${schedules.slice(0, 8).map((item, index) => {
     const today = localDateKey(new Date(), item.timezone || 'UTC');
     const compartment = item.compartment ?? index + 1;
     const taken = logs.some((log) => {
@@ -89,7 +110,7 @@ function pillBox(schedules, logs = []) {
         localDateKey(new Date(log.timestamp), item.timezone || 'UTC') === today;
     });
     return `<div class="pill-compartment ${taken ? 'taken' : ''}" data-compartment="${compartment}"><div class="pill-icon ${taken ? 'removed' : ''}" data-pill="${compartment}">${taken ? '' : '💊'}</div><div class="small fw-semibold">Compartment ${compartment}</div><div class="small text-secondary">${esc(item.time)} · ${taken ? 'Empty / Taken' : esc(item.med_name)}</div></div>`;
-  }).join('') || empty('No active compartments scheduled.')}</div></div>`;
+  }).join('') || empty('No active compartments scheduled.')}`;
 }
 function startBuzzer() {
   if (state.alarmAudio) return;
@@ -128,14 +149,49 @@ function localDateKey(now, timezone) {
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
 }
+function localAlarmKey(patientId, reminder) {
+  return `${localDateKey(new Date(), 'Asia/Kolkata')}:${patientId}:${reminder.id}`;
+}
+function checkAlarms() {
+  if (state.eventSource?.readyState === EventSource.OPEN) return;
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const current = `${values.hour}:${values.minute}`;
+  const patients = state.user?.role === 'Patient'
+    ? [{id: state.user.id, name: state.user.name, reminders: state.dashboardData?.schedules || []}]
+    : state.dashboardData?.patients || [];
+  patients.forEach((patient) => {
+    (patient.reminders || []).forEach((reminder) => {
+      const key = localAlarmKey(patient.id, reminder);
+      if (reminder.time === current && !state.fallbackAlarmKeys.has(key)) {
+        state.fallbackAlarmKeys.add(key);
+        if (state.user.role === 'Patient' && patient.id === state.user.id) {
+          triggerAlarm(patient.id, reminder, patient.name);
+        } else {
+          notify(`Alarm fired for ${reminder.med_name} at ${reminder.time}.`, 'info');
+        }
+      }
+    });
+  });
+}
 function configureAlarms() {
   if (!state.eventSource) {
     state.eventSource = new EventSource('/api/stream');
+    state.eventSource.onopen = () => setStreamStatus(false);
+    state.eventSource.onerror = () => setStreamStatus(true);
     state.eventSource.onmessage = (message) => {
       try {
         const event = JSON.parse(message.data);
-        if (event.type !== 'alarm') return;
-        const payload = event.payload;
+        const eventType = event.event_type || event.type;
+        const payload = event.payload || {};
+        if (eventType === 'schedule_updated' || eventType === 'log_updated') {
+          handleDataEvent(eventType, payload).catch((error) => notify(`Live update failed: ${error.message}`, 'danger'));
+          return;
+        }
+        if (eventType !== 'alarm') return;
         const reminder = {
           id: payload.reminder_id,
           med_name: payload.med_name,
@@ -143,17 +199,165 @@ function configureAlarms() {
           time: payload.time,
           compartment: payload.compartment,
         };
+        state.fallbackAlarmKeys.add(localAlarmKey(payload.patient_id, reminder));
         if (state.user.role === 'Patient' && payload.patient_id === state.user.id) {
           triggerAlarm(payload.patient_id, reminder);
         } else {
           notify(`Alarm fired for ${payload.med_name} at ${payload.time}.`, 'info');
         }
       } catch (error) {
-        notify(`Alarm event could not be read: ${error.message}`, 'danger');
+        notify(`Live event could not be read: ${error.message}`, 'danger');
       }
     };
   }
+  if (!state.alarmTimer) state.alarmTimer = setInterval(checkAlarms, 1000);
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+}
+function rememberDashboard(data) {
+  state.dashboardData = data;
+  if (state.user.role === 'Patient') {
+    state.schedules = data.schedules || [];
+  } else {
+    state.schedules = (data.patients || []).flatMap((patient) =>
+      (patient.reminders || []).map((reminder) => ({...reminder, patient_id: patient.id, patient_name: patient.name})));
+  }
+}
+function captureLiveSections(role) {
+  const view = $(`#${role.toLowerCase()}View`);
+  const heading = (text) => [...view.querySelectorAll('h2')].find((item) => item.textContent.trim() === text);
+  if (role === 'Patient') {
+    const pillHeading = heading('Interactive Pill Box');
+    pillHeading?.parentElement.querySelector('.pill-box')?.setAttribute('id', 'patientPillBoxContent');
+    const scheduleHeading = heading('Medication schedule');
+    scheduleHeading?.parentElement.querySelector('.row')?.setAttribute('id', 'patientScheduleCards');
+    heading('Recent activity')?.closest('section')?.setAttribute('id', 'patientActivity');
+  } else if (role === 'Doctor') {
+    heading('Assigned patients')?.closest('.card')?.setAttribute('id', 'doctorPatientSummary');
+    heading('Medication management')?.closest('section')?.setAttribute('id', 'doctorMedicationData');
+    heading('Recent activity')?.closest('section')?.setAttribute('id', 'doctorActivity');
+  } else {
+    view.querySelector('.row.g-3.mb-4')?.setAttribute('id', 'caregiverPatientSummary');
+    const activityHeading = heading('Live activity');
+    const activityCard = activityHeading?.closest('.card');
+    activityCard?.setAttribute('id', 'caregiverActivity');
+    if (activityCard) {
+      const content = [...activityCard.children].find((item) => item.classList.contains('table-responsive') ||
+        item.classList.contains('text-center'));
+      if (content) {
+        const wrapper = document.createElement('div');
+        wrapper.id = 'caregiverActivityContent';
+        content.replaceWith(wrapper);
+        wrapper.append(content);
+      }
+    }
+    [...view.querySelectorAll('h2')].filter((item) => item.textContent.trim() === 'Medication records')
+      .forEach((item, index) => item.closest('section')?.setAttribute('data-live-medications', String(index)));
+  }
+}
+function canUpdateFragment(element) {
+  if (!element || (element.contains(document.activeElement) && (
+    document.activeElement.matches('input, textarea, select, [contenteditable="true"]') ||
+    document.activeElement.closest('form')
+  ))) return false;
+  return true;
+}
+function setFragmentHTML(element, html) {
+  if (!canUpdateFragment(element)) return false;
+  element.innerHTML = html;
+  return true;
+}
+function updateFragment(element, html) {
+  if (!canUpdateFragment(element)) return false;
+  const template = document.createElement('template');
+  template.innerHTML = html.trim();
+  const replacement = template.content.firstElementChild;
+  if (!replacement) return false;
+  element.innerHTML = replacement.innerHTML;
+  return true;
+}
+function doctorPatientSummaryMarkup(patients) {
+  return `<div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}`;
+}
+function caregiverPatientSummaryMarkup(patients) {
+  return patients.length ? patients.map((patient) =>
+    `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`
+  ).join('') : empty('No patients are assigned to you yet.');
+}
+function caregiverActivityMarkup(logs) {
+  return logs.length
+    ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${logs.map(logRow).join('')}</tbody></table></div>`
+    : empty('No weight activity recorded yet.');
+}
+function bindCaregiverLogOverrides() {
+  document.querySelectorAll('#caregiverActivity [data-override]').forEach((button) => {
+    button.onclick = async () => {
+      const reason = window.prompt('Why are you confirming this dose?');
+      if (!reason) return;
+      try {
+        await api(`/api/caregiver/logs/${button.dataset.override}/override`, {
+          method: 'POST', body: JSON.stringify({reason}),
+        });
+        stopBuzzer();
+        notify('Medication marked as taken');
+        await loadCaregiver();
+      } catch (error) { notify(error.message, 'danger'); }
+    };
+  });
+}
+async function handleDataEvent(eventType, payload) {
+  const patientId = Number(payload.patient_id);
+  const schedule = payload.schedule;
+  if (eventType === 'schedule_updated' && schedule && state.user.role === 'Patient' &&
+      patientId === state.user.id) {
+    const index = state.schedules.findIndex((item) => Number(item.id) === Number(schedule.id));
+    if (index < 0) state.schedules.push(schedule);
+    else state.schedules[index] = {...state.schedules[index], ...schedule};
+  } else if (eventType === 'log_updated' && payload.log && state.user.role === 'Patient' &&
+      patientId === state.user.id) {
+    const currentLogs = state.dashboardData?.logs || [];
+    if (!currentLogs.some((item) => Number(item.id) === Number(payload.log.id))) {
+      state.dashboardData.logs = [payload.log, ...currentLogs];
+    }
+  }
+  const endpoint = state.user.role === 'Patient' ? '/api/patient/dashboard'
+    : state.user.role === 'Doctor' ? '/api/doctor/patients' : '/api/caregiver/dashboard';
+  const data = await api(endpoint);
+  rememberDashboard(data);
+  if (state.user.role === 'Patient') {
+    setFragmentHTML($('#patientPillBoxContent'), pillBoxContents(data.schedules, data.logs));
+    setFragmentHTML($('#patientScheduleCards'),
+      data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.'));
+    updateFragment($('#patientActivity'), activityPanel(data.logs));
+    return;
+  }
+  if (state.user.role === 'Doctor') {
+    const patients = data.patients;
+    const logs = patients.flatMap((patient) => (patient.logs || []).map((log) => ({...log, patient_name: patient.name})))
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    setFragmentHTML($('#doctorPatientSummary'), doctorPatientSummaryMarkup(patients));
+    if (eventType === 'schedule_updated') {
+      const panel = $('#doctorMedicationData');
+      const refreshed = doctorMedicationPanel(patients);
+      if (updateFragment(panel, refreshed)) bindDoctorMedicationPanel();
+    }
+    updateFragment($('#doctorActivity'), activityPanel(logs, true));
+    return;
+  }
+  const patients = data.patients;
+  setFragmentHTML($('#caregiverPatientSummary'), caregiverPatientSummaryMarkup(patients));
+  if (eventType === 'schedule_updated') {
+    const sections = [...document.querySelectorAll('#caregiverView [data-live-medications]')];
+    patients.forEach((patient, index) => {
+      const section = sections.find((item) => Number(item.dataset.liveMedications) === index);
+      if (updateFragment(section, medicationRecordsPanel(
+        patient.id, patient.medications || [], patient.medication_requests || [], true,
+      ))) bindMedicationPanels(patient.id);
+    });
+  }
+  const logs = data.logs || [];
+  if (setFragmentHTML($('#caregiverActivityContent'), caregiverActivityMarkup(logs))) {
+    bindCaregiverLogOverrides();
+  }
 }
 function startNextDoseCountdown(nextDose) {
   if (!$('#nextDoseCountdown')) return;
@@ -489,9 +693,9 @@ function medicationRecordsPanel(patientId, medications, requests, allowRequests)
   return `<section class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Medication records</h2><div>${records}</div>${form}<div class="mt-3"><h3 class="h6">Change request history</h3>${requestHistory}</div><div data-medication-audit="${patientId}" class="mt-3"></div></section>`;
 }
 
-function activityPanel(logs, includePatient = false) {
+function activityPanel(logs, includePatient = false, id = '') {
   const rows = logs.slice(0, 20).map((log) => `<tr>${includePatient ? `<td>${esc(log.patient_name)}</td>` : ''}<td>${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight || 0).toFixed(1)} g</td><td><span class="badge ${log.status === 'Taken' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${esc(log.status)}</span></td></tr>`).join('');
-  return `<section class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Recent activity</h2>${logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr>${includePatient ? '<th>Patient</th>' : ''}<th>Time</th><th>Weight change</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('No medication activity has been recorded yet.')}</section>`;
+  return `<section${id ? ` id="${id}"` : ''} class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Recent activity</h2>${logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr>${includePatient ? '<th>Patient</th>' : ''}<th>Time</th><th>Weight change</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('No medication activity has been recorded yet.')}</section>`;
 }
 
 function doctorMedicationPanel(patients) {
@@ -591,6 +795,7 @@ function bindDoctorMedicationPanel() {
 
 async function loadDoctor() {
   const data = await api('/api/doctor/patients'); showOnly('doctorView');
+  rememberDashboard(data);
   if (isEditingView('doctorView')) return;
   const patients = data.patients;
   setAssistantContext(patients, patients[0]?.id);
@@ -598,6 +803,7 @@ async function loadDoctor() {
     <div class="col-lg-4"><div class="card border-0 shadow-sm p-4"><h2 class="h5">Add a patient</h2><p class="small text-secondary">Link an existing patient by email.</p><form id="linkPatientForm" class="d-flex gap-2"><input name="email" type="email" class="form-control" placeholder="patient@email.com" required><button class="btn btn-primary">Add</button></form><div class="border-top mt-4 pt-3"><div class="small fw-semibold mb-2">Patient directory</div><form id="directoryForm" class="d-flex gap-2"><input name="search" class="form-control form-control-sm" placeholder="Search name or email"><button class="btn btn-sm btn-outline-primary">Search</button></form><div id="directoryResults" class="small mt-2"></div></div></div>
       <div class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">New medication schedule</h2><form id="scheduleForm"><select name="patient_id" class="form-select mb-2" required><option value="">Choose patient</option>${patients.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select><input name="med_name" class="form-control mb-2" placeholder="Medication name" required><div class="row g-2 mb-2"><div class="col"><input name="time" type="time" class="form-control" required></div><div class="col"><input name="compartment" type="number" min="1" max="8" class="form-control" placeholder="Compartment"></div></div><input name="dosage" class="form-control mb-2" placeholder="Dosage" required><div class="row g-2 mb-2"><div class="col"><label class="form-label small">Tablet g</label><input name="tablet_weight" type="number" min=".01" step=".01" value=".5" class="form-control"></div><div class="col"><label class="form-label small">Quantity</label><input name="expected_quantity" type="number" min="1" max="100" value="1" class="form-control"></div><div class="col"><label class="form-label small">Tolerance g</label><input name="tolerance" type="number" min=".01" step=".01" value=".2" class="form-control"></div></div><div class="row g-2 mb-3"><div class="col"><label class="form-label small">Response min</label><input name="response_window_minutes" type="number" min="1" max="1440" value="30" class="form-control"></div><div class="col"><label class="form-label small">Calibration g</label><input name="calibration_offset" type="number" step=".01" value="0" class="form-control"></div><div class="col"><label class="form-label small">Noise g</label><input name="noise_threshold" type="number" min=".01" step=".01" value=".15" class="form-control"></div></div><button class="btn btn-primary w-100">Sync schedule</button></form></div></div>
     <div class="col-lg-8"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Assigned patients</h2><span class="text-secondary small">${patients.length} linked</span></div>${patients.length ? patients.map(patientCard).join('') : empty('No patients linked yet.')}</div>${doctorMedicationPanel(patients)}${activityPanel(patients.flatMap((patient) => (patient.logs || []).map((log) => ({...log, patient_name: patient.name}))).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)), true)}${patients[0] ? aiLabPanel(patients[0].id, patients[0].risk, patients[0].logs) : emptyAiPanel('Link a patient to view their care insights.')}${communicationPanel(patients, patients[0]?.id)}${simulationPanel(patients)}</div></div>`;
+  captureLiveSections('Doctor');
   $('#linkPatientForm').onsubmit = async (event) => { event.preventDefault(); try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify(formData(event.target))}); notify('Patient linked'); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#scheduleForm').onsubmit = async (event) => { event.preventDefault(); const values = formData(event.target); try { await api(`/api/doctor/patients/${values.patient_id}/schedules`, {method:'POST', body: JSON.stringify(values)}); notify('Schedule synced to patient'); event.target.reset(); loadDoctor(); } catch (error) { notify(error.message, 'danger'); } };
   $('#directoryForm').onsubmit = async (event) => { event.preventDefault(); try { const results = await api(`/api/doctor/directory?search=${encodeURIComponent(formData(event.target).search)}`); $('#directoryResults').innerHTML = results.patients.length ? results.patients.map((p) => `<div class="d-flex justify-content-between align-items-center border-bottom py-2"><span>${esc(p.name)}<br><span class="text-secondary">${esc(p.email)}</span></span>${p.linked_to_doctor ? '<span class="badge text-bg-success">Linked</span>' : `<button data-directory-link="${p.email}" class="btn btn-sm btn-outline-primary">Link</button>`}</div>`).join('') : empty('No patients found.'); document.querySelectorAll('[data-directory-link]').forEach((button) => { button.onclick = async () => { try { await api('/api/doctor/patients/link', {method:'POST', body: JSON.stringify({email: button.dataset.directoryLink})}); notify('Patient linked'); await loadDoctor(); } catch (error) { notify(error.message, 'danger'); } }; }); } catch (error) { notify(error.message, 'danger'); } };
@@ -648,6 +854,7 @@ function patientCard(patient) { const latest = patient.logs?.[0]; return `<artic
 
 async function loadPatient() {
   const data = await api('/api/patient/dashboard'); showOnly('patientView');
+  rememberDashboard(data);
   if (isEditingView('patientView')) return;
   if (data.logs[0] && ['Taken', 'Manual Override'].includes(data.logs[0].status)) {
     stopBuzzer();
@@ -655,6 +862,7 @@ async function loadPatient() {
   const doctor = data.doctor;
   const nextReminder = data.next_dose?.reminder;
   $('#patientView').innerHTML = `<div class="provider-banner p-4 mb-4"><p class="small opacity-75 mb-1">PATIENT OVERVIEW <span class="badge text-bg-light ms-2">Connected account</span></p><h2 class="h4 mb-1">${doctor ? `Dr. ${esc(doctor.name)}` : 'No doctor assigned yet'}</h2><div class="small">${doctor ? esc(doctor.email) : 'Connect with your care team to begin.'}${data.caregiver ? ` · Caregiver: ${esc(data.caregiver.name)} (${esc(data.caregiver.email)})` : ''}</div></div><div id="patientConfirmation"></div>${pillBox(data.schedules, data.logs)}${medicationRecordsPanel(state.user.id, data.medications || [], data.medication_requests || [], true)}<div class="row g-4"><div class="col-lg-7"><div class="card border-0 shadow-sm p-4"><h2 class="h5 mb-3">Medication schedule</h2><div class="row g-3">${data.schedules.length ? data.schedules.map(scheduleCard).join('') : empty('Your care team has not added a schedule yet.')}</div></div></div><div class="col-lg-5"><div class="card border-0 shadow-sm p-4"><div class="d-flex justify-content-between"><h2 class="h5">Next dose</h2><span class="status-dot mt-2"></span></div><div id="nextDoseCountdown" class="metric mt-3">${nextReminder ? esc(nextReminder.time) : '--:--'}</div><p class="text-secondary mb-1">${nextReminder ? `${esc(nextReminder.med_name)} · ${esc(nextReminder.dosage)}` : 'Nothing scheduled'}</p><div class="small text-secondary">Patient time zone: ${esc(data.timezone)} <button id="syncTimezoneBtn" class="btn btn-sm btn-link p-0 ms-1">Use this device's time zone</button></div></div></div></div>${activityPanel(data.logs)}${aiLabPanel(state.user.id, data.risk || {level:'INSUFFICIENT_DATA', historical_factors:[], validation_limitations:'No prediction available.'}, data.logs)}${communicationPanel([{id: state.user.id, name: 'My care team'}], state.user.id)}${simulationPanel([{id: state.user.id, name: 'My account'}], false)}`;
+  captureLiveSections('Patient');
   setAssistantContext([], state.user.id);
   bindCommunication([{id: state.user.id, name: 'My care team'}], state.user.id);
   bindMedicationPanels(state.user.id);
@@ -676,10 +884,12 @@ function scheduleCard(item) { return `<div class="col-md-6"><div class="border r
 
 async function loadCaregiver() {
   const data = await api('/api/caregiver/dashboard'); showOnly('caregiverView');
+  rememberDashboard(data);
   if (isEditingView('caregiverView')) return;
   const selectedPatient = data.patients[0];
   setAssistantContext(data.patients, data.patients[0]?.id);
   $('#caregiverView').innerHTML = `<div class="row g-3 mb-4">${data.patients.length ? data.patients.map(patient => `<div class="col-md-6 col-xl-4"><div class="card border-0 shadow-sm p-3"><div class="small text-secondary">PATIENT</div><div class="fw-semibold mb-2">${esc(patient.name)}</div>${riskBadge(patient.risk)}<div class="small text-secondary mt-2">${patient.reminders.length} active schedules</div></div></div>`).join('') : empty('No patients are assigned to you yet.')}</div>${data.patients.map((patient) => medicationRecordsPanel(patient.id, patient.medications || [], patient.medication_requests || [], true)).join('')}<div class="card border-0 shadow-sm p-4"><div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div><h2 class="h5 mb-1">Live activity</h2><p class="small text-secondary mb-0">Refreshing automatically every 10 seconds</p></div><button id="notifyBtn" class="btn btn-primary btn-sm">Dispatch instant notification</button></div>${data.logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Patient</th><th>Timestamp</th><th>Weight delta</th><th>Status</th><th></th></tr></thead><tbody>${data.logs.map(logRow).join('')}</tbody></table></div>` : empty('No weight activity recorded yet.')}</div>${selectedPatient ? aiLabPanel(selectedPatient.id, selectedPatient.risk, data.logs.filter((log) => log.patient_id === selectedPatient.id)) : emptyAiPanel('AI Insights will be available when a patient is assigned.')}${communicationPanel(data.patients, data.patients[0]?.id)}${simulationPanel(data.patients)}`;
+  captureLiveSections('Caregiver');
   document.querySelectorAll('[data-override]').forEach((button) => button.onclick = async () => { const reason = window.prompt('Why are you confirming this dose?'); if (!reason) return; try { await api(`/api/caregiver/logs/${button.dataset.override}/override`, {method:'POST', body: JSON.stringify({reason})}); stopBuzzer(); notify('Medication marked as taken'); loadCaregiver(); } catch (error) { notify(error.message, 'danger'); } });
   $('#notifyBtn').onclick = () => dispatchNotification(data.patients);
   bindCommunication(data.patients, data.patients[0]?.id);
@@ -704,6 +914,7 @@ if (loginForm) loginForm.onsubmit = async (event) => {
   button.setAttribute('aria-busy', 'true');
   try {
     await api('/api/login', {method:'POST', body: JSON.stringify(formData(loginForm))});
+    closeEventStream();
     window.location.assign('/dashboard');
   } catch (error) {
     notify(error.message, 'danger');
@@ -728,8 +939,14 @@ if (signupForm) signupForm.onsubmit = async (event) => {
 };
 const logoutButton = $('#logoutBtn');
 if (logoutButton) logoutButton.onclick = async () => {
-  try { await api('/api/logout'); window.location.assign('/'); }
-  catch (error) { notify(error.message, 'danger'); }
+  try {
+    await api('/api/logout');
+    closeEventStream();
+    window.location.assign('/');
+  } catch (error) {
+    notify(error.message, 'danger');
+    if (state.user) configureAlarms();
+  }
 };
 const themeButton = $('#themeToggle');
 if (themeButton) themeButton.onclick = toggleTheme;

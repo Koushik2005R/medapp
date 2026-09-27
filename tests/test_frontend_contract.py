@@ -56,5 +56,10 @@ def test_dashboard_polls_preserve_active_form_inputs_and_pill_state_is_associate
 def test_alarm_delivery_uses_server_sent_events_instead_of_browser_clock_matching():
     javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert "new EventSource('/api/stream')" in javascript
-    assert "event.type !== 'alarm'" in javascript
-    assert "function checkAlarms()" not in javascript
+    assert "eventType !== 'alarm'" in javascript
+    assert "function checkAlarms()" in javascript
+    assert "eventType === 'schedule_updated' || eventType === 'log_updated'" in javascript
+    assert "handleDataEvent(eventType, payload)" in javascript
+    assert "state.eventSource.onerror = () => setStreamStatus(true)" in javascript
+    assert "Live updates reconnecting…" in javascript
+    assert "state.eventSource.close()" in javascript
