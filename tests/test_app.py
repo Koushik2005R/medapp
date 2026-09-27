@@ -1,4 +1,5 @@
 import os
+import json
 import urllib.error
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,7 @@ from app import (
     SensorEvent,
     User,
     create_app,
+    create_pill_log,
     db,
     event_schedule,
     local_occurrence,
@@ -73,6 +75,55 @@ def test_login_and_csrf_protect_mutations(tmp_path):
         headers={"X-CSRF-Token": token},
     )
     assert response.status_code == 201
+
+
+def test_sse_stream_broadcasts_committed_schedule_and_log_events_to_each_tab(tmp_path):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    patient_client = app.test_client()
+    patient_client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    patient_stream = patient_client.get("/api/stream", buffered=False)
+    try:
+        assert next(patient_stream.response).decode() == ": connected\n\n"
+
+        doctor = app.test_client()
+        doctor.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+        response = doctor.post(
+            f"/api/doctor/patients/{patient_id}/schedules",
+            json={"med_name": "New medicine", "time": "10:00", "dosage": "1 tablet"},
+            headers={"X-CSRF-Token": csrf(doctor)},
+        )
+        assert response.status_code == 201
+        schedule_message = next(patient_stream.response).decode()
+        assert schedule_message.startswith("data: ")
+        schedule_event = json.loads(schedule_message[6:].strip())
+        assert schedule_event["type"] == "schedule_updated"
+        assert schedule_event["payload"]["patient_id"] == patient_id
+    finally:
+        patient_stream.close()
+
+    doctor_stream = doctor.get("/api/stream", buffered=False)
+    try:
+        assert next(doctor_stream.response).decode() == ": connected\n\n"
+        with app.app_context():
+            patient = db.session.get(User, patient_id)
+            create_pill_log(
+                patient,
+                timestamp=utc_now(),
+                initial_weight=100,
+                final_weight=99.5,
+                delta_weight=0.5,
+                status="Taken",
+                reminder_id=1,
+            )
+            db.session.commit()
+        log_message = next(doctor_stream.response).decode()
+        log_event = json.loads(log_message[6:].strip())
+        assert log_event["type"] == "log_updated"
+        assert log_event["payload"]["log"]["patient_id"] == patient_id
+    finally:
+        doctor_stream.close()
+    assert doctor_id > 0
 
 
 def test_device_must_match_patient(tmp_path):

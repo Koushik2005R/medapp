@@ -15,7 +15,9 @@ import os
 import hashlib
 import secrets
 import re
+import queue
 import smtplib
+import threading
 import urllib.error
 import urllib.request
 from statistics import median
@@ -25,13 +27,14 @@ from functools import wraps
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import Session as OrmSession
 from werkzeug.security import check_password_hash, generate_password_hash
 from model import model_metadata, predict_explanation
 from sensor_analysis import (
@@ -50,6 +53,37 @@ class Base(DeclarativeBase):
 db = SQLAlchemy(model_class=Base)
 migrate = Migrate(compare_type=True)
 F = TypeVar("F", bound=Callable[..., Any])
+_sse_lock = threading.Lock()
+_sse_clients: dict[int, list[queue.Queue[str]]] = {}
+
+
+def publish_event(user_id: int, event_type: str, payload: dict[str, Any]) -> None:
+    message = json.dumps({"type": event_type, "payload": payload})
+    with _sse_lock:
+        clients = tuple(_sse_clients.get(user_id, ()))
+    for client_queue in clients:
+        client_queue.put(message)
+
+
+def _queue_patient_event(patient: User, event_type: str, payload: dict[str, Any]) -> None:
+    recipient_ids = {
+        patient.id,
+        patient.linked_doctor_id,
+        patient.linked_caregiver_id,
+    } - {None}
+    pending_events = db.session().info.setdefault("sse_events", [])
+    pending_events.extend((user_id, event_type, payload) for user_id in recipient_ids)
+
+
+@sqlalchemy_event.listens_for(OrmSession, "after_commit")
+def _publish_committed_events(session: OrmSession) -> None:
+    for user_id, event_type, payload in session.info.pop("sse_events", []):
+        publish_event(user_id, event_type, payload)
+
+
+@sqlalchemy_event.listens_for(OrmSession, "after_rollback")
+def _discard_rolled_back_events(session: OrmSession) -> None:
+    session.info.pop("sse_events", None)
 
 
 def utc_now() -> datetime:
@@ -772,6 +806,11 @@ def apply_medication_data(
         ):
             if field in data:
                 setattr(schedule, field, data[field])
+        db.session.flush()
+        _queue_patient_event(
+            patient, "schedule_updated",
+            {"patient_id": patient.id, "schedule": schedule.to_dict()},
+        )
     medication.status = "Active"
     medication.updated_at = utc_now()
     return medication
@@ -984,6 +1023,17 @@ def get_or_create_dose_event(
     return event
 
 
+def create_pill_log(patient: User, **values: Any) -> PillLog:
+    pill_log = PillLog(patient_id=patient.id, **values)
+    db.session.add(pill_log)
+    db.session.flush()
+    _queue_patient_event(
+        patient, "log_updated",
+        {"patient_id": patient.id, "log": pill_log.to_dict()},
+    )
+    return pill_log
+
+
 def expire_event(event: DoseEvent, now: datetime) -> bool:
     reminder = db.session.get(Reminder, event.reminder_id)
     if (
@@ -995,8 +1045,11 @@ def expire_event(event: DoseEvent, now: datetime) -> bool:
     event.state = "MISSED"
     event.completed_at = now
     if not db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id)):
-        db.session.add(PillLog(
-            patient_id=event.patient_id,
+        patient = db.session.get(User, event.patient_id)
+        if patient is None:
+            raise ValueError("dose event patient no longer exists")
+        create_pill_log(
+            patient,
             reminder_id=event.reminder_id,
             dose_event_id=event.id,
             compartment=event.compartment,
@@ -1007,7 +1060,7 @@ def expire_event(event: DoseEvent, now: datetime) -> bool:
             status="Missed",
             source=event.source,
             verification_method="response_window_expired",
-        ))
+        )
     if not event.notification_sent:
         patient = db.session.get(User, event.patient_id)
         dispatch_alert(patient, "Missed medication detected. Please check the patient's pill box.")
@@ -1021,8 +1074,11 @@ def complete_dose_event(
     existing = db.session.scalar(db.select(PillLog).where(PillLog.dose_event_id == event.id))
     if existing:
         return existing, None
-    pill_log = PillLog(
-        patient_id=event.patient_id,
+    patient = db.session.get(User, event.patient_id)
+    if patient is None:
+        raise ValueError("dose event patient no longer exists")
+    pill_log = create_pill_log(
+        patient,
         reminder_id=event.reminder_id,
         dose_event_id=event.id,
         compartment=event.compartment,
@@ -1034,8 +1090,6 @@ def complete_dose_event(
         source=event.source,
         verification_method=verification_method,
     )
-    db.session.add(pill_log)
-    db.session.flush()
     event.state = "MANUALLY_CONFIRMED"
     event.verification_method = verification_method
     event.completed_at = now
@@ -1414,6 +1468,38 @@ def register_routes(app: Flask) -> None:
             session.clear()
             return json_error("Authenticated user no longer exists", 401)
         return jsonify({"user": user.to_dict()})
+
+    @app.get("/api/stream")
+    @login_required
+    def stream_events():
+        user_id = session["user_id"]
+        client_queue: queue.Queue[str] = queue.Queue()
+
+        def generate():
+            with _sse_lock:
+                _sse_clients.setdefault(user_id, []).append(client_queue)
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        message = client_queue.get(timeout=20)
+                    except queue.Empty:
+                        yield ": heartbeat\n\n"
+                    else:
+                        yield f"data: {message}\n\n"
+            finally:
+                with _sse_lock:
+                    clients = _sse_clients.get(user_id, [])
+                    if client_queue in clients:
+                        clients.remove(client_queue)
+                    if not clients:
+                        _sse_clients.pop(user_id, None)
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/aiml/prediction/<int:patient_id>")
     @app.get("/api/aiml/risk/<int:patient_id>")
@@ -1988,6 +2074,10 @@ def register_routes(app: Flask) -> None:
         medication.updated_at = utc_now()
         add_medication_audit(patient.id, actor.id, "SCHEDULE_ADDED", medication, before_data)
         notify_medication_change(patient, actor, f"Your doctor added a schedule for {medication.name}.")
+        _queue_patient_event(
+            patient, "schedule_updated",
+            {"patient_id": patient.id, "schedule": reminder.to_dict()},
+        )
         db.session.commit()
         return jsonify({"status": "success", "schedule": reminder.to_dict()}), 201
 
@@ -2294,4 +2384,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run()
+    app.run(threaded=True)
