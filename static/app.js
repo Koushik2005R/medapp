@@ -1,4 +1,4 @@
-const state = { user: null, timer: null, eventSource: null, alarmTimer: null, fallbackAlarmKeys: new Set(), dashboardData: null, countdownTimer: null, alarmAudio: null, audioContext: null, audioUnlocked: false, vibrationTimer: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
+const state = { user: null, timer: null, eventSource: null, alarmTimer: null, streamHealthTimer: null, fallbackAlarmKeys: new Set(), dashboardData: null, countdownTimer: null, alarmAudio: null, audioContext: null, audioUnlocked: false, vibrationTimer: null, alarm: null, simulationUnlocked: false, csrfToken: '', assistantPatientId: null, assistantContextKey: '', assistantRequestId: 0, assistantController: null };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
 const theme = localStorage.getItem('pillguard-theme') || 'light';
@@ -31,6 +31,8 @@ function closeEventStream() {
   state.eventSource = null;
   if (state.alarmTimer) clearInterval(state.alarmTimer);
   state.alarmTimer = null;
+  if (state.streamHealthTimer) clearInterval(state.streamHealthTimer);
+  state.streamHealthTimer = null;
   state.fallbackAlarmKeys.clear();
   state.dashboardData = null;
   const status = $('#streamStatus');
@@ -43,6 +45,26 @@ function setStreamStatus(reconnecting) {
   status.classList.toggle('d-none', !reconnecting);
   status.classList.toggle('text-warning', reconnecting);
   status.classList.toggle('text-success', !reconnecting);
+}
+async function checkStreamHealth() {
+  const indicator = $('#streamHealth');
+  if (!indicator) return;
+  try {
+    await api('/api/stream/ping');
+    indicator.textContent = 'Server reachable';
+    indicator.classList.remove('text-danger');
+    indicator.classList.add('text-success');
+  } catch {
+    indicator.textContent = 'Server unreachable';
+    indicator.classList.remove('text-success');
+    indicator.classList.add('text-danger');
+  }
+  indicator.classList.remove('d-none');
+}
+function startStreamHealthCheck() {
+  if (state.streamHealthTimer) clearInterval(state.streamHealthTimer);
+  checkStreamHealth();
+  state.streamHealthTimer = setInterval(checkStreamHealth, 30000);
 }
 function bindSectionNavigation(role) {
   const view = $(`#${role.toLowerCase()}View`);
@@ -1054,6 +1076,7 @@ if ($('#dashboardView')) {
     $('#dashboardLoading').classList.add('d-none');
     try {
       await loadDashboard();
+      startStreamHealthCheck();
       state.timer = setInterval(() => loadDashboard().catch((error) => notify(`Dashboard refresh failed: ${error.message}`, 'danger')), 10000);
     } catch (error) {
       $('#dashboardLoading').classList.remove('d-none');

@@ -908,6 +908,103 @@ def test_schedule_time_validation_and_authorization(tmp_path):
     assert doctor_id == 1
 
 
+def test_assigned_care_team_can_edit_and_deactivate_a_schedule(tmp_path):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    patient = app.test_client()
+    patient.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    stream = patient.get("/api/stream", buffered=False)
+    assert next(stream.response).decode() == ": connected\n\n"
+    doctor = app.test_client()
+    doctor.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    token = csrf(doctor)
+    try:
+        updated = doctor.patch(
+            f"/api/doctor/patients/{patient_id}/schedules/1",
+            json={"med_name": "Renamed medicine", "time": "10:45", "dosage": "2 tablets", "compartment": "  "},
+            headers={"X-CSRF-Token": token},
+        )
+        assert updated.status_code == 200
+        schedule = updated.get_json()["schedule"]
+        assert schedule["med_name"] == "Renamed medicine"
+        assert schedule["time"] == "10:45"
+        assert schedule["dosage"] == "2 tablets"
+        assert schedule["compartment"] is None
+        edit_event = json.loads(next(stream.response).decode()[6:].strip())
+        assert edit_event["type"] == "schedule_updated"
+        assert edit_event["payload"]["schedule"]["time"] == "10:45"
+
+        deactivated = doctor.post(
+            f"/api/doctor/patients/{patient_id}/schedules/1/deactivate",
+            headers={"X-CSRF-Token": token},
+        )
+        assert deactivated.status_code == 200
+        assert deactivated.get_json()["schedule"]["status"] == "Completed"
+        deactivate_event = json.loads(next(stream.response).decode()[6:].strip())
+        assert deactivate_event["payload"]["schedule"]["status"] == "Completed"
+        with app.app_context():
+            assert db.session.get(Reminder, 1).status == "Completed"
+        assert doctor_id == 1
+    finally:
+        stream.close()
+
+
+def test_schedule_edits_reject_invalid_fields_and_unassigned_users(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    doctor = app.test_client()
+    doctor.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    token = csrf(doctor)
+    invalid = doctor.patch(
+        f"/api/doctor/patients/{patient_id}/schedules/1",
+        json={"time": "25:00"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert invalid.status_code == 400
+    with app.app_context():
+        outsider_user = User(name="Other Doctor", email="other@example.com", role="Doctor", password_hash="")
+        outsider_user.set_password("password123")
+        db.session.add(outsider_user)
+        db.session.commit()
+    outsider = app.test_client()
+    outsider.post("/api/login", json={"email": "other@example.com", "password": "password123"})
+    denied = outsider.post(
+        f"/api/doctor/patients/{patient_id}/schedules/1/deactivate",
+        headers={"X-CSRF-Token": csrf(outsider)},
+    )
+    assert denied.status_code == 403
+
+
+def test_assigned_caregiver_can_edit_schedules_but_not_another_patients(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    with app.app_context():
+        caregiver = User(name="Caregiver", email="caregiver@example.com", role="Caregiver", password_hash="")
+        caregiver.set_password("password123")
+        db.session.add(caregiver)
+        db.session.flush()
+        db.session.get(User, patient_id).linked_caregiver_id = caregiver.id
+        db.session.commit()
+    client = app.test_client()
+    client.post("/api/login", json={"email": "caregiver@example.com", "password": "password123"})
+    response = client.patch(
+        f"/api/doctor/patients/{patient_id}/schedules/1",
+        json={"time": "11:15"},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["schedule"]["time"] == "11:15"
+
+
+def test_stream_ping_requires_authentication(tmp_path):
+    app = make_app(tmp_path)
+    seed(app)
+    client = app.test_client()
+    assert client.get("/api/stream/ping").status_code == 401
+    client.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    assert client.get("/api/stream/ping").get_json() == {"status": "ok"}
+
+
 def test_alarm_acknowledgement_rejects_firing_older_than_one_hour(tmp_path):
     app = make_app(tmp_path)
     _, patient_id, _ = seed(app)

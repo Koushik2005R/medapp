@@ -1612,6 +1612,11 @@ def register_routes(app: Flask) -> None:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/stream/ping")
+    @login_required
+    def stream_ping():
+        return jsonify({"status": "ok"})
+
     @app.get("/api/aiml/prediction/<int:patient_id>")
     @app.get("/api/aiml/risk/<int:patient_id>")
     @role_required("Doctor", "Patient", "Caregiver")

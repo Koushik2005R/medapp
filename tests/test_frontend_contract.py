@@ -75,3 +75,16 @@ def test_alarm_audio_is_unlocked_by_login_gesture_with_vibration_fallback():
     assert "context.resume()" in javascript
     assert "navigator.vibrate([500, 200, 500])" in javascript
     assert "navigator.vibrate?.(0)" in javascript
+
+
+def test_schedules_have_live_edit_controls_and_independent_stream_health_check():
+    javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "data-edit-schedule" in javascript
+    assert "data-deactivate-schedule" in javascript
+    assert "method: 'PATCH'" in javascript
+    assert "/deactivate" in javascript
+    assert "async function checkStreamHealth()" in javascript
+    assert "setInterval(checkStreamHealth, 30000)" in javascript
+    assert "/api/stream/ping" in javascript
+    assert 'id="streamHealth"' in template
