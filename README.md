@@ -148,6 +148,20 @@ clearly-labeled unlock button so demo scenarios do not require waiting for a
 real-time reminder. Do not use the demo database or credentials for real
 patient information.
 
+## Real-time behavior
+
+The dashboard uses server-sent events at `/api/stream` for live schedule,
+activity, and medication alarm updates. SSE holds one connection open per
+browser tab, so the server must support threaded requests (`app.run(threaded=True)`
+or a threaded/eventlet-capable production worker); a plain single-threaded
+server will block other requests while streams are connected. The alarm
+scheduler interprets reminder times in `Asia/Kolkata`.
+
+The SSE queue registry is in memory and is shared only within one application
+process. This is suitable for the single-process demo/development setup, but a
+multi-instance deployment needs a shared event broker so events reach clients
+connected to any server instance.
+
 ### Five-minute demonstration
 
 1. **0:00-0:40 — Sign in as the doctor.** Open `http://127.0.0.1:5000`,
