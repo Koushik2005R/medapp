@@ -117,6 +117,113 @@ def test_alarm_dispatcher_persists_and_broadcasts_once_per_local_date(tmp_path, 
         assert firing.acknowledged_at is None
 
 
+def test_alarm_dispatcher_expires_unanswered_dose_and_broadcasts_missed_log(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    fired_at = datetime(2026, 9, 27, 2, 30, tzinfo=timezone.utc)
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = "08:00"
+        reminder.response_window_minutes = 1
+        db.session.commit()
+    doctor = app.test_client()
+    doctor.post("/api/login", json={"email": "doctor@example.com", "password": "password123"})
+    added = doctor.post(
+        f"/api/doctor/patients/{patient_id}/schedules",
+        json={"med_name": "New tablet", "time": "08:00", "dosage": "1 tablet", "compartment": 2},
+        headers={"X-CSRF-Token": csrf(doctor)},
+    )
+    assert added.status_code == 201
+    added_reminder_id = added.get_json()["schedule"]["id"]
+    with app.app_context():
+        db.session.get(Reminder, added_reminder_id).response_window_minutes = 1
+        db.session.commit()
+    received = []
+    monkeypatch.setattr(
+        "app.publish_event",
+        lambda user_id, event_type, payload: received.append((user_id, event_type, payload)),
+    )
+
+    assert dispatch_due_alarms(app, fired_at) == 2
+    assert dispatch_due_alarms(app, fired_at + timedelta(minutes=2)) == 0
+    with app.app_context():
+        event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.patient_id == patient_id))
+        log = db.session.scalar(db.select(PillLog).where(
+            PillLog.patient_id == patient_id,
+            PillLog.reminder_id == added_reminder_id,
+        ))
+        assert event.state == "MISSED"
+        assert log.status == "Missed"
+        assert log.verification_method == "response_window_expired"
+    patient = app.test_client()
+    patient.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    patient_logs = patient.get("/api/patient/dashboard").get_json()["logs"]
+    assert any(log["reminder_id"] == added_reminder_id and log["status"] == "Missed" for log in patient_logs)
+    doctor_logs = doctor.get("/api/doctor/patients").get_json()["patients"][0]["logs"]
+    assert any(log["reminder_id"] == added_reminder_id and log["status"] == "Missed" for log in doctor_logs)
+    missed_events = [item for item in received if item[1] == "log_updated"]
+    assert {item[0] for item in missed_events} == {doctor_id, patient_id}
+    assert missed_events[0][2]["log"]["status"] == "Missed"
+
+
+def test_patient_can_report_alarm_outcome_and_care_team_receives_log(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    doctor_id, patient_id, _ = seed(app)
+    fired_at = utc_now()
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = fired_at.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%H:%M")
+        db.session.commit()
+    received = []
+    monkeypatch.setattr(
+        "app.publish_event",
+        lambda user_id, event_type, payload: received.append((user_id, event_type, payload)),
+    )
+    assert dispatch_due_alarms(app, fired_at) == 1
+    with app.app_context():
+        event = db.session.scalar(db.select(DoseEvent).where(DoseEvent.patient_id == patient_id))
+        assert event is not None
+        reminder_id = event.reminder_id
+    patient = app.test_client()
+    patient.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = patient.post(
+        f"/api/patient/doses/{reminder_id}/report",
+        json={"outcome": "taken"},
+        headers={"X-CSRF-Token": csrf(patient)},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["log"]["verification_method"] == "patient_self_report"
+    assert response.get_json()["event"]["state"] == "MANUALLY_CONFIRMED"
+    assert patient.post(
+        f"/api/patient/doses/{reminder_id}/report",
+        json={"outcome": "not_taken"},
+        headers={"X-CSRF-Token": csrf(patient)},
+    ).status_code == 409
+    log_events = [item for item in received if item[1] == "log_updated"]
+    assert {item[0] for item in log_events} == {doctor_id, patient_id}
+
+
+def test_patient_can_report_dose_not_taken(tmp_path):
+    app = make_app(tmp_path)
+    _, patient_id, _ = seed(app)
+    fired_at = utc_now()
+    with app.app_context():
+        reminder = db.session.get(Reminder, 1)
+        reminder.time = fired_at.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%H:%M")
+        db.session.commit()
+    assert dispatch_due_alarms(app, fired_at) == 1
+    client = app.test_client()
+    client.post("/api/login", json={"email": "patient@example.com", "password": "password123"})
+    response = client.post(
+        "/api/patient/doses/1/report",
+        json={"outcome": "not_taken"},
+        headers={"X-CSRF-Token": csrf(client)},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["event"]["state"] == "MISSED"
+    assert response.get_json()["log"]["verification_method"] == "patient_reported_not_taken"
+
+
 def test_sse_stream_broadcasts_committed_schedule_and_log_events_to_each_tab(tmp_path):
     app = make_app(tmp_path)
     doctor_id, patient_id, _ = seed(app)

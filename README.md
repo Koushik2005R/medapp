@@ -188,6 +188,12 @@ or a threaded/eventlet-capable production worker); a plain single-threaded
 server will block other requests while streams are connected. The alarm
 scheduler interprets reminder times in `Asia/Kolkata`.
 
+At an alarm, patients can report that they took the dose or did not take it;
+these responses appear immediately in patient and care-team activity. A
+patient-reported response is not sensor verification and does not prove
+swallowing. If there is no response, the scheduler records a missed dose after
+the reminder's configured response window, even when no dashboard is open.
+
 The SSE queue registry is in memory and is shared only within one application
 process. This is suitable for the single-process demo/development setup, but a
 multi-instance deployment needs a shared event broker so events reach clients

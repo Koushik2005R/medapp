@@ -88,3 +88,14 @@ def test_schedules_have_live_edit_controls_and_independent_stream_health_check()
     assert "setInterval(checkStreamHealth, 30000)" in javascript
     assert "/api/stream/ping" in javascript
     assert 'id="streamHealth"' in template
+
+
+def test_alarm_ui_records_patient_response_and_displays_reported_missed_doses():
+    javascript = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "data-report-dose=\"taken\"" in template
+    assert "data-report-dose=\"not_taken\"" in template
+    assert "/api/patient/doses/${state.alarm.reminder.id}/report" in javascript
+    assert "Patient reported taken" in javascript
+    assert "Patient reported not taken" in javascript
+    assert "response window expired" in javascript

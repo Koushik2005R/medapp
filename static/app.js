@@ -206,7 +206,14 @@ function unlockSimulation() {
   document.querySelectorAll('[data-simulation-lock]').forEach((element) => element.classList.add('d-none'));
 }
 function triggerAlarm(patientId, reminder, patientName = state.user.name) {
-  state.alarm = { patientId, reminder };
+  state.alarm = {
+    patientId, reminder, eventId: reminder.event_id,
+    firedAt: reminder.fired_at || new Date().toISOString(),
+  };
+  if (state.user.role === 'Patient' && patientId === state.user.id) {
+    $('#pendingDoseMedication').textContent = `${reminder.med_name} · ${reminder.dosage} at ${reminder.time}`;
+    $('#pendingDoseResponse')?.classList.remove('d-none');
+  }
   startBuzzer();
   if ('speechSynthesis' in window) {
     window.speechSynthesis.cancel();
@@ -215,6 +222,28 @@ function triggerAlarm(patientId, reminder, patientName = state.user.name) {
   $('#alarmMedication').textContent = `${reminder.med_name} · ${reminder.dosage} at ${reminder.time}`;
   bootstrap.Modal.getOrCreateInstance($('#alarmModal')).show();
   if ('Notification' in window && Notification.permission === 'granted') new Notification('PillGuard medication reminder', {body: 'MEDICATION TIME! Please access your Pill Box now.'});
+}
+function clearAlarmResponse() {
+  stopBuzzer();
+  state.alarm = null;
+  $('#pendingDoseResponse')?.classList.add('d-none');
+  bootstrap.Modal.getOrCreateInstance($('#alarmModal')).hide();
+}
+async function reportAlarmOutcome(outcome) {
+  if (!state.alarm || state.user.role !== 'Patient' || state.alarm.patientId !== state.user.id) return;
+  try {
+    await api(`/api/patient/doses/${state.alarm.reminder.id}/report`, {
+      method: 'POST',
+      body: JSON.stringify({outcome}),
+    });
+    stopBuzzer();
+    window.speechSynthesis?.cancel();
+    clearAlarmResponse();
+    notify(outcome === 'taken'
+      ? 'Recorded your response as taken (self-reported, not sensor-verified).'
+      : 'Recorded this dose as not taken.');
+    await loadPatient();
+  } catch (error) { notify(error.message, 'danger'); }
 }
 function localDateKey(now, timezone) {
   const parts = new Intl.DateTimeFormat('en-US', {timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(now);
@@ -266,10 +295,12 @@ function configureAlarms() {
         if (eventType !== 'alarm') return;
         const reminder = {
           id: payload.reminder_id,
+          event_id: payload.event_id,
           med_name: payload.med_name,
           dosage: payload.dosage,
           time: payload.time,
           compartment: payload.compartment,
+          fired_at: payload.fired_at,
         };
         state.fallbackAlarmKeys.add(localAlarmKey(payload.patient_id, reminder));
         if (state.user.role === 'Patient' && payload.patient_id === state.user.id) {
@@ -393,6 +424,14 @@ async function handleDataEvent(eventType, payload) {
     const currentLogs = state.dashboardData?.logs || [];
     if (!currentLogs.some((item) => Number(item.id) === Number(payload.log.id))) {
       state.dashboardData.logs = [payload.log, ...currentLogs];
+    }
+    const eventMatchesAlarm = state.alarm && state.alarm.eventId != null &&
+      Number(payload.log.dose_event_id) === Number(state.alarm.eventId);
+    const reminderMatchesAlarm = state.alarm &&
+      Number(payload.log.reminder_id) === Number(state.alarm.reminder.id) &&
+      new Date(payload.log.timestamp) >= new Date(state.alarm.firedAt);
+    if (eventMatchesAlarm || reminderMatchesAlarm) {
+      clearAlarmResponse();
     }
   }
   const endpoint = state.user.role === 'Patient' ? '/api/patient/dashboard'
@@ -540,9 +579,12 @@ function bindSimulation(patients) {
     if (!state.alarm) return;
     try {
       await api('/api/alarm/acknowledge', {method:'POST', body: JSON.stringify({patient_id: state.alarm.patientId, reminder_id: state.alarm.reminder.id})});
-      stopBuzzer(); window.speechSynthesis?.cancel(); unlockSimulation(); bootstrap.Modal.getOrCreateInstance($('#alarmModal')).hide(); notify('Alarm acknowledged. Awaiting sensor confirmation.');
+      stopBuzzer(); window.speechSynthesis?.cancel(); unlockSimulation(); bootstrap.Modal.getOrCreateInstance($('#alarmModal')).hide(); $('#pendingDoseResponse')?.classList.remove('d-none'); notify('Alarm silenced. Record whether you took the dose when ready.');
     } catch (error) { notify(error.message, 'danger'); }
   };
+  document.querySelectorAll('[data-report-dose]').forEach((button) => {
+    button.onclick = () => reportAlarmOutcome(button.dataset.reportDose);
+  });
   if (patientSelect.value) refreshSimulationEvents(Number(patientSelect.value));
 }
 async function refreshSimulationEvents(patientId) {
@@ -771,8 +813,17 @@ function medicationRecordsPanel(patientId, medications, requests, allowRequests)
   return `<section class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Medication records</h2><div>${records}</div>${form}<div class="mt-3"><h3 class="h6">Change request history</h3>${requestHistory}</div><div data-medication-audit="${patientId}" class="mt-3"></div></section>`;
 }
 
+function logOutcomeLabel(log) {
+  if (log.verification_method === 'patient_self_report') return 'Patient reported taken';
+  if (log.verification_method === 'patient_reported_not_taken') return 'Patient reported not taken';
+  if (log.verification_method === 'response_window_expired') return 'Missed (response window expired)';
+  if (log.status === 'Manual Override' && log.verification_method === 'caregiver_override') return 'Taken (caregiver reported)';
+  if (log.status === 'Taken') return 'Taken (Weight Verified)';
+  if (log.status === 'Manual Override') return 'Taken (caregiver reported)';
+  return log.status;
+}
 function activityPanel(logs, includePatient = false, id = '') {
-  const rows = logs.slice(0, 20).map((log) => `<tr>${includePatient ? `<td>${esc(log.patient_name)}</td>` : ''}<td>${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight || 0).toFixed(1)} g</td><td><span class="badge ${log.status === 'Taken' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${esc(log.status)}</span></td></tr>`).join('');
+  const rows = logs.slice(0, 20).map((log) => `<tr>${includePatient ? `<td>${esc(log.patient_name)}</td>` : ''}<td>${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight || 0).toFixed(1)} g</td><td><span class="badge ${log.status === 'Taken' || log.status === 'Manual Override' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${esc(logOutcomeLabel(log))}</span></td></tr>`).join('');
   return `<section${id ? ` id="${id}"` : ''} class="card border-0 shadow-sm p-4 mt-4"><h2 class="h5">Recent activity</h2>${logs.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr>${includePatient ? '<th>Patient</th>' : ''}<th>Time</th><th>Weight change</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('No medication activity has been recorded yet.')}</section>`;
 }
 
@@ -929,7 +980,7 @@ async function bindAiLab(patientId) {
     $('#sensorLab').innerHTML = `<h3 class="h6">Sensor anomaly experiment <span class="badge text-bg-info">${esc(sensorMetrics.model_version)}</span></h3><p class="small text-secondary">${esc(sensorMetrics.data_source)} · ${Number(sensorMetrics.test_rows)} held-out synthetic windows</p><div class="table-responsive"><table class="table table-sm"><caption class="caption-top small">Isolation Forest compared with threshold-rule anomaly flags.</caption><thead><tr><th scope="col">Detector</th><th scope="col">Precision</th><th scope="col">Recall</th><th scope="col">F1</th><th scope="col">ROC-AUC</th></tr></thead><tbody><tr><th scope="row">Isolation Forest</th><td>${Number(sensorMetrics.isolation_forest.precision).toFixed(3)}</td><td>${Number(sensorMetrics.isolation_forest.recall).toFixed(3)}</td><td>${Number(sensorMetrics.isolation_forest.f1).toFixed(3)}</td><td>${sensorMetrics.isolation_forest.roc_auc == null ? 'n/a' : Number(sensorMetrics.isolation_forest.roc_auc).toFixed(3)}</td></tr><tr><th scope="row">Threshold baseline</th><td>${Number(sensorMetrics.threshold_baseline.precision).toFixed(3)}</td><td>${Number(sensorMetrics.threshold_baseline.recall).toFixed(3)}</td><td>${Number(sensorMetrics.threshold_baseline.f1).toFixed(3)}</td><td>n/a</td></tr></tbody></table></div><div class="row g-2"><div class="col-md-6">${confusionTable('Isolation Forest', sensorMetrics.isolation_forest.confusion_matrix)}</div><div class="col-md-6">${confusionTable('Threshold baseline', sensorMetrics.threshold_baseline.confusion_matrix)}</div></div><div class="small fw-semibold">Held-out scenario flag rates</div>${Object.entries(sensorMetrics.per_scenario).map(([name, item]) => `<div class="sensor-scenario"><strong>${esc(name.replaceAll('_', ' '))}</strong><span class="small">Isolation Forest ${Number(item.isolation_forest_flag_rate * 100).toFixed(0)}%</span><span class="small">Threshold ${Number(item.threshold_flag_rate * 100).toFixed(0)}%</span><small>${Number(item.test_rows)} cases</small></div>`).join('')}<div class="small text-secondary mt-2">${esc(sensorMetrics.validation_limitations)}</div><h4 class="h6 mt-3">Repeatable live examples</h4>${sensor.scenarios.map((item) => `<div class="sensor-scenario"><strong>${esc(item.scenario)}</strong><span class="badge ${item.anomaly_detection.is_anomaly ? 'text-bg-danger' : 'text-bg-success'}">ML ${item.anomaly_detection.is_anomaly ? 'anomaly' : 'normal'}</span><span class="badge text-bg-light">Threshold ${esc(item.threshold_detection.event)}</span><small>score ${item.anomaly_detection.anomaly_score}</small></div>`).join('')}`;
   } catch (error) { if ($('#aiMetrics')) $('#aiMetrics').innerHTML = `<div class="alert alert-warning">AI Insights unavailable: ${esc(error.message)}</div>`; }
 }
-function patientCard(patient) { const latest = patient.logs?.[0]; return `<article class="border-top py-3"><div class="d-flex justify-content-between align-items-start gap-2"><div><h3 class="h6 mb-1">${esc(patient.name)}</h3><small class="text-secondary">${esc(patient.email)}</small><div class="small text-secondary mt-2">${patient.caregiver ? `Caregiver: ${esc(patient.caregiver.email)}` : 'No caregiver linked'}</div></div><div class="text-end">${riskBadge(patient.risk)}<div class="small text-secondary mt-1">${patient.reminders.length} active schedules</div></div></div>${scheduleManagementMarkup(patient)}${latest ? `<div class="small mt-2"><span class="badge ${latest.status === 'Taken' ? 'text-bg-success' : latest.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${latest.status === 'Taken' ? 'Taken (Weight Verified)' : latest.status === 'Manual Override' ? 'Taken (Caregiver Override)' : 'Missed (Timeout)'}</span> ${new Date(latest.timestamp).toLocaleString()}</div>` : ''}<button data-link-caregiver data-patient-id="${patient.id}" class="btn btn-sm btn-outline-primary mt-2">${patient.caregiver ? 'Change caregiver' : 'Link caregiver'}</button></article>`; }
+function patientCard(patient) { const latest = patient.logs?.[0]; return `<article class="border-top py-3"><div class="d-flex justify-content-between align-items-start gap-2"><div><h3 class="h6 mb-1">${esc(patient.name)}</h3><small class="text-secondary">${esc(patient.email)}</small><div class="small text-secondary mt-2">${patient.caregiver ? `Caregiver: ${esc(patient.caregiver.email)}` : 'No caregiver linked'}</div></div><div class="text-end">${riskBadge(patient.risk)}<div class="small text-secondary mt-1">${patient.reminders.length} active schedules</div></div></div>${scheduleManagementMarkup(patient)}${latest ? `<div class="small mt-2"><span class="badge ${latest.status === 'Taken' || latest.status === 'Manual Override' ? 'text-bg-success' : 'text-bg-danger'}">${esc(logOutcomeLabel(latest))}</span> ${new Date(latest.timestamp).toLocaleString()}</div>` : ''}<button data-link-caregiver data-patient-id="${patient.id}" class="btn btn-sm btn-outline-primary mt-2">${patient.caregiver ? 'Change caregiver' : 'Link caregiver'}</button></article>`; }
 
 function bindDoctorScheduleControls() {
   document.querySelectorAll('#doctorPatientSummary [data-edit-schedule]').forEach((form) => {
@@ -964,6 +1015,11 @@ async function loadPatient() {
   const data = await api('/api/patient/dashboard'); showOnly('patientView');
   rememberDashboard(data);
   if (isEditingView('patientView')) return;
+  if (state.alarm && data.logs.some((log) =>
+    Number(log.reminder_id) === Number(state.alarm.reminder.id) &&
+    new Date(log.timestamp) >= new Date(state.alarm.firedAt))) {
+    clearAlarmResponse();
+  }
   if (data.logs[0] && ['Taken', 'Manual Override'].includes(data.logs[0].status)) {
     stopBuzzer();
   }
@@ -1007,7 +1063,7 @@ async function loadCaregiver() {
   if (selectedPatient) bindAiLab(selectedPatient.id);
   bindSectionNavigation('Caregiver');
 }
-function logRow(log) { const canOverride = log.status === 'Missed'; const label = log.status === 'Taken' ? 'Taken (Weight Verified)' : log.status === 'Manual Override' ? 'Taken (Caregiver Override)' : 'Missed (Timeout)'; return `<tr><td class="fw-semibold">${esc(log.patient_name)}</td><td class="small">${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight).toFixed(1)}g</td><td><span class="badge ${log.status === 'Taken' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${label}</span></td><td>${canOverride ? `<button data-override="${log.id}" class="btn btn-sm btn-outline-success">Mark taken</button>` : ''}</td></tr>`; }
+function logRow(log) { const canOverride = log.status === 'Missed'; const label = log.verification_method === 'patient_self_report' ? 'Patient reported taken' : log.verification_method === 'patient_reported_not_taken' ? 'Patient reported not taken' : log.status === 'Taken' ? 'Taken (Weight Verified)' : log.status === 'Manual Override' ? 'Taken (Caregiver reported)' : log.verification_method === 'response_window_expired' ? 'Missed (Timeout)' : 'Missed'; return `<tr><td class="fw-semibold">${esc(log.patient_name)}</td><td class="small">${new Date(log.timestamp).toLocaleString()}</td><td>${Number(log.delta_weight).toFixed(1)}g</td><td><span class="badge ${log.status === 'Taken' || log.status === 'Manual Override' ? 'text-bg-success' : log.status === 'Missed' ? 'text-bg-danger' : 'text-bg-primary'}">${label}</span></td><td>${canOverride ? `<button data-override="${log.id}" class="btn btn-sm btn-outline-success">Mark taken</button>` : ''}</td></tr>`; }
 async function dispatchNotification(patients) { if (!patients.length) return notify('No assigned patients', 'warning'); const patient = prompt(`Patient ID (${patients.map(p => `${p.id}: ${p.name}`).join(', ')}):`); const message = prompt('Notification message:'); if (!patient || !message) return; try { await api('/api/caregiver/notify', {method:'POST', body: JSON.stringify({patient_id: Number(patient), message})}); notify('Notification dispatched'); } catch (error) { notify(error.message, 'danger'); } }
 
 async function loadDashboard() { if (state.user.role === 'Doctor') await loadDoctor(); else if (state.user.role === 'Patient') await loadPatient(); else await loadCaregiver(); }

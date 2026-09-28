@@ -548,6 +548,7 @@ def dispatch_due_alarms(app: Flask, now: datetime | None = None) -> int:
     firing_time = local_now.strftime("%H:%M")
     published: list[tuple[set[int], dict[str, Any]]] = []
     with app.app_context():
+        changed = False
         reminders = db.session.scalars(db.select(Reminder).where(
             Reminder.status == "Active",
             Reminder.time == firing_time,
@@ -573,6 +574,9 @@ def dispatch_due_alarms(app: Flask, now: datetime | None = None) -> int:
             patient = db.session.get(User, reminder.patient_id)
             if patient is None:
                 raise ValueError(f"reminder {reminder.id} references a missing patient")
+            event, _ = event_for_occurrence(patient, reminder, fired_now, "server_alarm")
+            if event.state == "REMINDER_DUE":
+                event.state = "ALERTING"
             recipients = {
                 patient.id,
                 patient.linked_doctor_id,
@@ -581,13 +585,23 @@ def dispatch_due_alarms(app: Flask, now: datetime | None = None) -> int:
             published.append((recipients, {
                 "patient_id": patient.id,
                 "reminder_id": reminder.id,
+                "event_id": event.id,
                 "med_name": reminder.med_name,
                 "dosage": reminder.dosage,
                 "time": reminder.time,
                 "compartment": reminder.compartment,
                 "fired_at": fired_now.isoformat(),
             }))
-        if published:
+            changed = True
+
+        pending_events = db.session.scalars(db.select(DoseEvent).where(
+            DoseEvent.state.in_({"ALERTING", "AWAITING_CONFIRMATION", "REMOVAL_DETECTED"}),
+            DoseEvent.due_at <= fired_now,
+        )).all()
+        for event in pending_events:
+            changed = expire_event(event, fired_now) or changed
+
+        if changed:
             db.session.commit()
         else:
             db.session.rollback()
@@ -2464,6 +2478,79 @@ def register_routes(app: Flask) -> None:
             "reminder_id": reminder.id,
             "state": event.state,
             "event": event.to_dict(),
+        })
+
+    @app.post("/api/patient/doses/<int:reminder_id>/report")
+    @role_required("Patient")
+    def report_patient_dose(reminder_id: int):
+        patient = current_user()
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or data.get("outcome") not in {"taken", "not_taken"}:
+            return json_error("outcome must be taken or not_taken", 400)
+        now = utc_now()
+        reminder = db.session.get(Reminder, reminder_id)
+        if reminder is None or reminder.patient_id != patient.id or reminder.status != "Active":
+            return json_error("scheduled reminder not found", 404)
+        firing = db.session.scalar(db.select(AlarmFiring).where(
+            AlarmFiring.reminder_id == reminder.id,
+            AlarmFiring.firing_date == now.astimezone(ALARM_TIMEZONE).date(),
+        ).order_by(AlarmFiring.fired_at.desc()).limit(1))
+        if firing is None:
+            return json_error("there is no active alarm for this dose", 409)
+        event, _ = event_for_occurrence(patient, reminder, as_utc(firing.fired_at), "server_alarm")
+        if event.state == "REMINDER_DUE":
+            event.state = "ALERTING"
+        if event.state not in {"ALERTING", "AWAITING_CONFIRMATION", "REMOVAL_DETECTED"}:
+            return json_error("this dose has already been reported or closed", 409)
+        if now > as_utc(firing.fired_at) + timedelta(minutes=reminder.response_window_minutes):
+            expire_event(event, now)
+            db.session.commit()
+            return json_error("the response window for this dose has passed", 409)
+        if firing is not None and firing.acknowledged_at is None:
+            firing.acknowledged_at = now
+        event.acknowledged_at = event.acknowledged_at or now
+        if data["outcome"] == "taken":
+            event.state = "MANUALLY_CONFIRMED"
+            event.verification_method = "patient_self_report"
+            event.completed_at = now
+            pill_log = create_pill_log(
+                patient,
+                reminder_id=reminder.id,
+                dose_event_id=event.id,
+                compartment=event.compartment,
+                timestamp=now,
+                initial_weight=event.initial_weight or 0.0,
+                final_weight=event.final_weight or 0.0,
+                delta_weight=event.filtered_delta or 0.0,
+                status="Manual Override",
+                remarks="Patient reported taking dose",
+                source=event.source,
+                verification_method="patient_self_report",
+            )
+        else:
+            event.state = "MISSED"
+            event.completed_at = now
+            event.verification_method = "patient_reported_not_taken"
+            pill_log = create_pill_log(
+                patient,
+                reminder_id=reminder.id,
+                dose_event_id=event.id,
+                compartment=event.compartment,
+                timestamp=now,
+                initial_weight=event.initial_weight or 0.0,
+                final_weight=event.final_weight or 0.0,
+                delta_weight=event.filtered_delta or 0.0,
+                status="Missed",
+                remarks="Patient reported dose not taken",
+                source=event.source,
+                verification_method="patient_reported_not_taken",
+            )
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "outcome": data["outcome"],
+            "event": event.to_dict(),
+            "log": pill_log.to_dict(),
         })
 
     @app.post("/api/simulation/events/<int:event_id>/confirm")
